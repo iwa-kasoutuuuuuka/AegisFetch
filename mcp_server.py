@@ -1,24 +1,32 @@
 """
-AegisFetch MCP Server
-=====================
+AegisFetch MCP Server (v2.0)
+============================
 Model Context Protocol (MCP) server for Antigravity, Claude Code, and Claude Desktop.
-Enables LLMs to download catalogs, technical datasheets, and PDFs while bypassing 403 blocks
-with built-in SSRF and Path Traversal guardrails.
+Features:
+- Single & Batch PDF/Catalog downloads with WAF/403 evasion
+- Automatic Part Number -> PDF resolution (Extractor Engine)
+- Generic Web Page PDF Link discovery (with Playwright SPA fallback)
+- Non-blocking Background Job Queue (prevents 60s MCP tool call timeouts on huge batches)
+- Deep-defense SSRF (including Open Redirect hops), Path Traversal, and Stream Size guards
 """
 
 import os
-import sys
+import uuid
+import time
 import json
+import threading
 from typing import Optional, List, Dict, Any
 from mcp.server.mcpserver import MCPServer
 
 from aegisfetch import AegisFetch, __version__
+from extractors import CatalogExtractor
 from security import (
     validate_url,
+    validate_output_directory,
     sanitize_filename,
     secure_output_path,
     SecurityValidationError,
-    DEFAULT_MAX_FILE_SIZE
+    DEFAULT_MAX_FILE_SIZE,
 )
 
 # Initialize MCP Server instance
@@ -26,21 +34,25 @@ server = MCPServer(
     name="AegisFetch",
     version=__version__,
     instructions=(
-        "AegisFetch is a high-resilience catalog and PDF document downloader. "
-        "Use this tool when downloading files from websites protected by Cloudflare or strict WAFs "
-        "that return 403 Forbidden or 429 Too Many Requests to standard downloaders."
+        "AegisFetch v2.0 is a high-resilience catalog and PDF downloader. "
+        "It can download direct URLs, extract PDF links from web pages, resolve part numbers (like BALLUFF order codes) "
+        "automatically into datasheets, and run large batches as non-blocking background jobs."
     )
 )
 
 DEFAULT_BASE_DIR = os.path.abspath(os.environ.get("AEGISFETCH_DOWNLOAD_DIR", "./downloads"))
+
+# In-memory background job registry for non-blocking large batch downloads
+_JOBS_LOCK = threading.Lock()
+_BACKGROUND_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
 @server.tool(
     name="aegisfetch_download_single",
     description=(
         "Download a single catalog or PDF document safely. "
-        "Bypasses 403/WAF blocks using browser TLS fingerprinting and adaptive flow control. "
-        "Protected against SSRF and Path Traversal."
+        "Bypasses 403/WAF blocks using browser TLS fingerprinting, hop-by-hop redirect SSRF validation, "
+        "and streamed file size limits."
     )
 )
 def download_single(
@@ -51,35 +63,23 @@ def download_single(
     verify_pdf: bool = True
 ) -> str:
     """
-    Download a single file.
-    
-    Args:
-        url: The HTTP/HTTPS URL of the target document.
-        filename: Optional desired local filename (e.g., 'BES0002.pdf').
-        referer: Optional HTTP Referer header to bypass hotlink protection.
-        output_dir: Optional destination directory (defaults to ./downloads).
-        verify_pdf: Verify that the payload is a valid PDF (%PDF header).
+    Download a single file from a URL.
     """
     try:
-        # Security Guardrail 1: SSRF Validation
         safe_url = validate_url(url)
-
-        # Security Guardrail 2: Path Traversal Validation
-        target_dir = os.path.abspath(output_dir or DEFAULT_BASE_DIR)
+        target_dir = validate_output_directory(output_dir or DEFAULT_BASE_DIR)
         os.makedirs(target_dir, exist_ok=True)
-        
-        safe_name = sanitize_filename(filename or url.split("?")[0].split("/")[-1])
+
+        safe_name = sanitize_filename(filename or safe_url.split("?")[0].split("/")[-1])
         if verify_pdf and not safe_name.lower().endswith(".pdf"):
             safe_name += ".pdf"
 
-        # Ensure path stays inside target_dir
-        final_path = secure_output_path(target_dir, safe_name)
+        secure_output_path(target_dir, safe_name)
 
-        # Execute Download
         fetcher = AegisFetch(
             output_dir=target_dir,
             min_delay=0.5,
-            max_delay=1.5,
+            max_delay=1.2,
             verify_pdf=verify_pdf
         )
 
@@ -89,7 +89,7 @@ def download_single(
             referer=referer
         )
 
-        res_dict = {
+        return json.dumps({
             "success": result.success,
             "url": result.url,
             "saved_path": result.save_path,
@@ -97,8 +97,7 @@ def download_single(
             "size_kb": round(result.size_bytes / 1024, 2),
             "skipped_because_exists": result.skipped,
             "error": result.error_msg
-        }
-        return json.dumps(res_dict, ensure_ascii=False, indent=2)
+        }, ensure_ascii=False, indent=2)
 
     except SecurityValidationError as sve:
         return json.dumps({
@@ -115,38 +114,141 @@ def download_single(
 
 
 @server.tool(
+    name="aegisfetch_download_by_part_number",
+    description=(
+        "Automatically resolve product part numbers / order codes (such as BALLUFF 'BES0002') "
+        "into their official datasheet PDF URLs and download them."
+    )
+)
+def download_by_part_number(
+    part_numbers: List[str],
+    output_dir: Optional[str] = None,
+    locale: str = "ja-jp"
+) -> str:
+    """
+    Resolve part numbers and download their datasheets.
+    
+    Args:
+        part_numbers: List of part numbers or order codes (e.g. ['BES0002', 'BES0003']). Max 25 for synchronous call.
+        output_dir: Optional destination directory.
+        locale: Country/language locale code (default 'ja-jp').
+    """
+    if not part_numbers or not isinstance(part_numbers, list):
+        return json.dumps({"success": False, "message": "part_numbers must be a non-empty list."})
+
+    if len(part_numbers) > 25:
+        return json.dumps({
+            "success": False,
+            "message": "For more than 25 part numbers, please use 'aegisfetch_start_batch_job' to avoid MCP timeouts."
+        })
+
+    try:
+        target_dir = validate_output_directory(output_dir or DEFAULT_BASE_DIR)
+        os.makedirs(target_dir, exist_ok=True)
+
+        fetcher = AegisFetch(output_dir=target_dir, min_delay=0.5, max_delay=1.2)
+        results = []
+        errors = []
+
+        for part in part_numbers:
+            try:
+                resolved = CatalogExtractor.resolve_balluff_part(
+                    part,
+                    locale=locale,
+                    session=fetcher.session
+                )
+                dl_res = fetcher.download_file(
+                    url=resolved["url"],
+                    filename=resolved["filename"],
+                    referer=resolved["referer"]
+                )
+                results.append({
+                    "part_number": part,
+                    "order_code": resolved["order_code"],
+                    "pdf_url": resolved["url"],
+                    "saved_path": dl_res.save_path,
+                    "success": dl_res.success,
+                    "size_kb": round(dl_res.size_bytes / 1024, 2),
+                    "skipped": dl_res.skipped,
+                    "error": dl_res.error_msg
+                })
+            except Exception as e:
+                errors.append({"part_number": part, "error": str(e)})
+
+        return json.dumps({
+            "success": True,
+            "total_requested": len(part_numbers),
+            "downloaded_count": sum(1 for r in results if r["success"]),
+            "failed_count": len(errors) + sum(1 for r in results if not r["success"]),
+            "results": results,
+            "resolution_errors": errors
+        }, ensure_ascii=False, indent=2)
+
+    except SecurityValidationError as sve:
+        return json.dumps({"success": False, "error_type": "SecurityValidationError", "message": str(sve)})
+    except Exception as e:
+        return json.dumps({"success": False, "error_type": type(e).__name__, "message": str(e)})
+
+
+@server.tool(
+    name="aegisfetch_extract_pdf_links",
+    description=(
+        "Scan a product web page URL and extract all downloadable PDF / datasheet links. "
+        "Automatically falls back to headless Playwright browser if the page requires JavaScript."
+    )
+)
+def extract_pdf_links(page_url: str, use_playwright_fallback: bool = True) -> str:
+    """
+    Extract PDF links from a web page.
+    """
+    try:
+        links = CatalogExtractor.extract_pdf_links_from_url(
+            page_url=page_url,
+            use_playwright_fallback=use_playwright_fallback
+        )
+        return json.dumps({
+            "success": True,
+            "page_url": page_url,
+            "found_count": len(links),
+            "pdf_links": links
+        }, ensure_ascii=False, indent=2)
+    except SecurityValidationError as sve:
+        return json.dumps({"success": False, "error_type": "SecurityValidationError", "message": str(sve)})
+    except Exception as e:
+        return json.dumps({"success": False, "error_type": type(e).__name__, "message": str(e)})
+
+
+@server.tool(
     name="aegisfetch_download_batch",
     description=(
-        "Download multiple catalogs or documents in batch. "
-        "Executes with randomized jitter, automatic exponential backoff on 403/429, "
-        "and circuit breaker protection to avoid IP bans."
+        "Synchronously download up to 25 URLs in batch. "
+        "For larger lists (26 to 500 items), use 'aegisfetch_start_batch_job' instead to prevent timeouts."
     )
 )
 def download_batch(
     urls: List[str],
     output_dir: Optional[str] = None,
-    min_delay: float = 1.0,
-    max_delay: float = 2.5,
+    min_delay: float = 0.8,
+    max_delay: float = 1.8,
     verify_pdf: bool = True
 ) -> str:
     """
-    Download a list of URLs with flow control.
-    
-    Args:
-        urls: List of HTTP/HTTPS URLs (maximum 50 items per call).
-        output_dir: Destination directory.
-        min_delay: Minimum delay between requests in seconds.
-        max_delay: Maximum delay between requests in seconds.
-        verify_pdf: Check for %PDF header.
+    Synchronous batch download for small-to-medium lists.
     """
     if not urls or not isinstance(urls, list):
         return json.dumps({"success": False, "message": "urls must be a non-empty list of URLs."})
 
     if len(urls) > 50:
-        return json.dumps({"success": False, "message": "Batch size limit exceeded. Maximum 50 URLs allowed per batch call."})
+        return json.dumps({
+            "success": False,
+            "message": "Batch size limit exceeded (max 50 for synchronous call). Use 'aegisfetch_start_batch_job' for large batches."
+        })
 
-    target_dir = os.path.abspath(output_dir or DEFAULT_BASE_DIR)
-    os.makedirs(target_dir, exist_ok=True)
+    try:
+        target_dir = validate_output_directory(output_dir or DEFAULT_BASE_DIR)
+        os.makedirs(target_dir, exist_ok=True)
+    except SecurityValidationError as sve:
+        return json.dumps({"success": False, "error_type": "SecurityValidationError", "message": str(sve)})
 
     validated_targets = []
     rejected_urls = []
@@ -161,14 +263,14 @@ def download_batch(
 
     fetcher = AegisFetch(
         output_dir=target_dir,
-        min_delay=max(0.5, min_delay),
-        max_delay=max(1.0, max_delay),
+        min_delay=max(0.4, min_delay),
+        max_delay=max(0.8, max_delay),
         verify_pdf=verify_pdf
     )
 
     results = fetcher.download_batch(validated_targets)
 
-    summary = {
+    return json.dumps({
         "total_requested": len(urls),
         "total_validated": len(validated_targets),
         "total_rejected_security": len(rejected_urls),
@@ -188,8 +290,153 @@ def download_batch(
             for r in results
         ],
         "security_rejected": rejected_urls
-    }
-    return json.dumps(summary, ensure_ascii=False, indent=2)
+    }, ensure_ascii=False, indent=2)
+
+
+def _run_background_job(
+    job_id: str,
+    items: List[str],
+    is_part_numbers: bool,
+    target_dir: str,
+    min_delay: float,
+    max_delay: float
+):
+    """Worker thread function for non-blocking large batch downloads."""
+    fetcher = AegisFetch(output_dir=target_dir, min_delay=min_delay, max_delay=max_delay)
+
+    for idx, item in enumerate(items, 1):
+        try:
+            if is_part_numbers and not item.lower().startswith("http"):
+                resolved = CatalogExtractor.resolve_balluff_part(item, session=fetcher.session)
+                res = fetcher.download_file(
+                    url=resolved["url"],
+                    filename=resolved["filename"],
+                    referer=resolved["referer"]
+                )
+            else:
+                safe_u = validate_url(item)
+                fname = sanitize_filename(safe_u.split("?")[0].split("/")[-1])
+                res = fetcher.download_file(url=safe_u, filename=fname)
+
+            entry = {
+                "item": item,
+                "saved_path": res.save_path,
+                "success": res.success,
+                "skipped": res.skipped,
+                "size_kb": round(res.size_bytes / 1024, 2),
+                "error": res.error_msg
+            }
+        except Exception as e:
+            entry = {
+                "item": item,
+                "saved_path": None,
+                "success": False,
+                "skipped": False,
+                "size_kb": 0,
+                "error": str(e)
+            }
+
+        with _JOBS_LOCK:
+            job = _BACKGROUND_JOBS[job_id]
+            job["completed_items"] = idx
+            job["results"].append(entry)
+            if entry["success"]:
+                job["success_count"] += 1
+            else:
+                job["failed_count"] += 1
+
+    with _JOBS_LOCK:
+        _BACKGROUND_JOBS[job_id]["status"] = "completed"
+        _BACKGROUND_JOBS[job_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+@server.tool(
+    name="aegisfetch_start_batch_job",
+    description=(
+        "Start a non-blocking background job to download a large list of URLs or part numbers (up to 500 items). "
+        "Returns a job_id immediately so MCP never times out. Poll progress with 'aegisfetch_get_job_status'."
+    )
+)
+def start_batch_job(
+    items: List[str],
+    is_part_numbers: bool = False,
+    output_dir: Optional[str] = None,
+    min_delay: float = 0.8,
+    max_delay: float = 1.8
+) -> str:
+    """
+    Launch an asynchronous background batch download job.
+    """
+    if not items or not isinstance(items, list):
+        return json.dumps({"success": False, "message": "items must be a non-empty list."})
+
+    if len(items) > 500:
+        return json.dumps({"success": False, "message": "Maximum 500 items allowed per background job."})
+
+    try:
+        target_dir = validate_output_directory(output_dir or DEFAULT_BASE_DIR)
+        os.makedirs(target_dir, exist_ok=True)
+    except SecurityValidationError as sve:
+        return json.dumps({"success": False, "error_type": "SecurityValidationError", "message": str(sve)})
+
+    job_id = f"job_{uuid.uuid4().hex[:8]}"
+    with _JOBS_LOCK:
+        _BACKGROUND_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "total_items": len(items),
+            "completed_items": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "output_dir": target_dir,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": None,
+            "results": []
+        }
+
+    worker = threading.Thread(
+        target=_run_background_job,
+        args=(job_id, items, is_part_numbers, target_dir, max(0.4, min_delay), max(0.8, max_delay)),
+        daemon=True
+    )
+    worker.start()
+
+    return json.dumps({
+        "success": True,
+        "job_id": job_id,
+        "status": "running",
+        "total_items": len(items),
+        "output_dir": target_dir,
+        "message": f"Background job '{job_id}' started. Call 'aegisfetch_get_job_status' with this job_id to check progress."
+    }, ensure_ascii=False, indent=2)
+
+
+@server.tool(
+    name="aegisfetch_get_job_status",
+    description="Check the progress and results of a background download job started by 'aegisfetch_start_batch_job'."
+)
+def get_job_status(job_id: str) -> str:
+    """
+    Retrieve status of a background job.
+    """
+    with _JOBS_LOCK:
+        job = _BACKGROUND_JOBS.get(job_id)
+        if not job:
+            return json.dumps({"success": False, "message": f"Job ID '{job_id}' not found."})
+
+        return json.dumps({
+            "success": True,
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "progress": f"{job['completed_items']}/{job['total_items']}",
+            "percent": round((job["completed_items"] / max(1, job["total_items"])) * 100, 1),
+            "success_count": job["success_count"],
+            "failed_count": job["failed_count"],
+            "output_dir": job["output_dir"],
+            "started_at": job["started_at"],
+            "finished_at": job["finished_at"],
+            "recent_results": job["results"][-10:]
+        }, ensure_ascii=False, indent=2)
 
 
 @server.tool(
@@ -199,9 +446,6 @@ def download_batch(
 def verify_file(file_path: str) -> str:
     """
     Verify integrity of a downloaded file.
-    
-    Args:
-        file_path: Full path to the file to inspect.
     """
     abs_path = os.path.abspath(file_path)
     if not os.path.exists(abs_path):
@@ -233,19 +477,31 @@ def verify_file(file_path: str) -> str:
 
 @server.tool(
     name="aegisfetch_get_status",
-    description="Get AegisFetch MCP server operational status, version, and configuration."
+    description="Get AegisFetch MCP server operational status, version, active jobs, and security capabilities."
 )
 def get_status() -> str:
     """Return status and configuration."""
+    with _JOBS_LOCK:
+        active_jobs = sum(1 for j in _BACKGROUND_JOBS.values() if j["status"] == "running")
+        total_jobs = len(_BACKGROUND_JOBS)
+
     return json.dumps({
         "status": "online",
         "name": "AegisFetch MCP Server",
         "version": __version__,
         "supported_fingerprints": AegisFetch.IMPERSONATE_TARGETS,
         "default_download_dir": DEFAULT_BASE_DIR,
+        "max_file_size_mb": DEFAULT_MAX_FILE_SIZE // (1024 * 1024),
+        "background_jobs": {
+            "active": active_jobs,
+            "total": total_jobs
+        },
         "security_features": [
             "SSRF Prevention (Private/Loopback/Metadata IP Block)",
+            "Open-Redirect SSRF Hop Inspection (Max 5 Hops)",
+            "System Directory Write Protection",
             "Path Traversal Prevention (Strict basename & commonpath check)",
+            "Streamed Chunk Download with 100MB Size Cutoff",
             "Magic Byte Payload Inspection (%PDF validation)",
             "Atomic Disk Writes (.tmp before rename)",
             "Adaptive Exponential Backoff & Circuit Breaker"

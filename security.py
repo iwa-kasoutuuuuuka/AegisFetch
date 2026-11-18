@@ -1,15 +1,16 @@
 """
-AegisFetch Security Guardrails
-==============================
-SSRF, Path Traversal, and Resource Exhaustion protection for MCP operations.
+AegisFetch Security Guardrails (v2.0)
+=====================================
+Deep-defense SSRF (including Open Redirect hops), Path Traversal,
+System Folder Protection, and Stream Size Exhaustion guards.
 """
 
 import os
 import re
 import socket
 import ipaddress
-from urllib.parse import urlparse
-from typing import Optional, Tuple
+from urllib.parse import urlparse, urljoin
+from typing import Optional
 
 # Disallowed private / internal IP networks (SSRF prevention)
 BLOCKED_NETWORKS = [
@@ -40,10 +41,28 @@ BLOCKED_HOSTNAMES = {
     "localhost",
     "metadata.google.internal",
     "instance-data",
+    "metadata",
 }
 
-# Max file size limit: 100 MB by default to prevent disk exhaustion
+# Critical OS directories forbidden as output_dir
+FORBIDDEN_DIR_PATTERNS = [
+    r"^[a-z]:\\windows",
+    r"^[a-z]:\\program files",
+    r"^[a-z]:\\programdata",
+    r"\\appdata\\roaming\\microsoft\\windows\\start menu\\programs\\startup",
+    r"^(?:[a-z]:)?/etc(?:/|$)",
+    r"^(?:[a-z]:)?/bin(?:/|$)",
+    r"^(?:[a-z]:)?/sbin(?:/|$)",
+    r"^(?:[a-z]:)?/usr(?:/|$)",
+    r"^(?:[a-z]:)?/var(?:/|$)",
+    r"^(?:[a-z]:)?/root(?:/|$)",
+    r"^(?:[a-z]:)?/proc(?:/|$)",
+    r"^(?:[a-z]:)?/sys(?:/|$)",
+]
+
+# Max file size limit: 100 MB by default to prevent disk/memory exhaustion
 DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024
+MAX_REDIRECT_HOPS = 5
 
 
 class SecurityValidationError(ValueError):
@@ -75,14 +94,15 @@ def validate_url(url: str, allow_private_ip: bool = False) -> str:
         raise SecurityValidationError(f"Access to blocked internal hostname '{hostname}' is forbidden.")
 
     if not allow_private_ip:
-        # Check if hostname is already an IP address
         try:
             ip = ipaddress.ip_address(hostname)
             for net in BLOCKED_NETWORKS:
                 if ip in net:
-                    raise SecurityValidationError(f"Access to private/internal IP address '{ip}' is blocked (SSRF Protection).")
+                    raise SecurityValidationError(
+                        f"Access to private/internal IP address '{ip}' is blocked (SSRF Protection)."
+                    )
         except ValueError:
-            # Hostname is a domain name -> Resolve DNS to inspect target IP
+            # Resolve domain name to inspect all target A/AAAA records
             try:
                 addr_info = socket.getaddrinfo(hostname, None)
                 for item in addr_info:
@@ -93,11 +113,41 @@ def validate_url(url: str, allow_private_ip: bool = False) -> str:
                             raise SecurityValidationError(
                                 f"Hostname '{hostname}' resolves to private/internal IP '{ip}', which is blocked (SSRF Protection)."
                             )
-            except socket.gaierror as e:
-                # DNS failure: will fail during fetch anyway, but let it proceed if unresolvable here
+            except socket.gaierror:
                 pass
 
     return url
+
+
+def validate_redirect_target(current_url: str, location_header: str, allow_private_ip: bool = False) -> str:
+    """
+    Resolve relative/absolute HTTP Redirect Location header and validate against SSRF.
+    Prevents Open-Redirect-to-Internal-Network attacks.
+    """
+    if not location_header:
+        raise SecurityValidationError("Redirect response missing Location header.")
+    next_url = urljoin(current_url, location_header.strip())
+    return validate_url(next_url, allow_private_ip=allow_private_ip)
+
+
+def validate_output_directory(output_dir: str) -> str:
+    """
+    Ensure output directory is not a critical system directory or startup folder.
+    """
+    if not output_dir or not isinstance(output_dir, str):
+        raise SecurityValidationError("Output directory must be a valid path string.")
+
+    abs_dir = os.path.abspath(output_dir)
+    norm_lower = abs_dir.lower().replace("/", "\\")
+    posix_lower = abs_dir.lower().replace("\\", "/")
+
+    for pattern in FORBIDDEN_DIR_PATTERNS:
+        if re.search(pattern, norm_lower) or re.search(pattern, posix_lower):
+            raise SecurityValidationError(
+                f"Writing to protected system directory '{abs_dir}' is forbidden."
+            )
+
+    return abs_dir
 
 
 def sanitize_filename(filename: Optional[str], default_name: str = "download.pdf") -> str:
@@ -107,9 +157,7 @@ def sanitize_filename(filename: Optional[str], default_name: str = "download.pdf
     if not filename or not isinstance(filename, str):
         filename = default_name
 
-    # Strip any directory traversal components (../../ etc)
     base = os.path.basename(filename.strip().replace("\\", "/"))
-    # Allow only safe characters: alphanumeric, dot, underscore, hyphen
     safe = re.sub(r"[^a-zA-Z0-9._\-]", "_", base)
     safe = safe.strip("._ ")
     if not safe:
@@ -119,13 +167,12 @@ def sanitize_filename(filename: Optional[str], default_name: str = "download.pdf
 
 def secure_output_path(base_dir: str, filename: str) -> str:
     """
-    Ensure the resolved path strictly resides within base_dir.
+    Ensure the resolved path strictly resides within a validated base_dir.
     """
-    abs_base = os.path.abspath(base_dir)
+    abs_base = validate_output_directory(base_dir)
     safe_name = sanitize_filename(filename)
     target_path = os.path.abspath(os.path.join(abs_base, safe_name))
 
-    # Verify that target_path starts with abs_base
     try:
         common = os.path.commonpath([abs_base, target_path])
         if common != abs_base:

@@ -1,8 +1,14 @@
 """
-AegisFetch (PhantomDL)
-======================
+AegisFetch (PhantomDL) v2.0
+===========================
 High-resilience, anti-403, and WAF-evading catalog & document downloader.
-TLS/JA3/JA4 fingerprint impersonation, adaptive rate-limiting, and atomic verification.
+Features:
+- TLS/JA3/JA4 fingerprint impersonation (curl_cffi)
+- SSRF-safe hop-by-hop redirect validation
+- Streamed chunk downloading with strict max file size guard (100MB default)
+- Adaptive rate-limiting (Jitter, Exponential Backoff, Circuit Breaker)
+- Automatic Playwright headless fallback for JS-heavy / SPA endpoints
+- Built-in Part Number Extractor (BALLUFF & Generic web pages)
 
 Copyright (c) 2026 iwa-kasoutuuuuuka
 Licensed under the MIT License.
@@ -17,7 +23,19 @@ from typing import Optional, List, Dict, Callable
 from dataclasses import dataclass
 from curl_cffi import requests
 
-__version__ = "1.0.0"
+from security import (
+    validate_url,
+    validate_redirect_target,
+    validate_output_directory,
+    sanitize_filename,
+    secure_output_path,
+    SecurityValidationError,
+    DEFAULT_MAX_FILE_SIZE,
+    MAX_REDIRECT_HOPS,
+)
+
+__version__ = "2.0.0"
+
 
 @dataclass
 class DownloadResult:
@@ -32,9 +50,8 @@ class DownloadResult:
 
 class AegisFetch:
     """
-    AegisFetch Downloader Core Engine
+    AegisFetch v2.0 Downloader Core Engine
     """
-    # Supported browser impersonation targets
     IMPERSONATE_TARGETS = ["chrome124", "chrome120", "safari15_5", "chrome110"]
 
     def __init__(
@@ -45,9 +62,11 @@ class AegisFetch:
         max_retries: int = 4,
         circuit_breaker_threshold: int = 5,
         proxy: Optional[str] = None,
-        verify_pdf: bool = True
+        verify_pdf: bool = True,
+        max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+        enable_playwright_fallback: bool = True,
     ):
-        self.output_dir = os.path.abspath(output_dir)
+        self.output_dir = validate_output_directory(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.min_delay = min_delay
@@ -56,6 +75,8 @@ class AegisFetch:
         self.circuit_breaker_threshold = circuit_breaker_threshold
         self.proxy = proxy
         self.verify_pdf = verify_pdf
+        self.max_file_size = max_file_size
+        self.enable_playwright_fallback = enable_playwright_fallback
 
         self.consecutive_failures = 0
         self.session: Optional[requests.Session] = None
@@ -68,7 +89,7 @@ class AegisFetch:
         if self.proxy:
             self.session.proxies = {
                 "http": self.proxy,
-                "https": self.proxy
+                "https": self.proxy,
             }
         self.session.headers.update({
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
@@ -87,7 +108,8 @@ class AegisFetch:
         """Verify downloaded file integrity (exclude HTML error pages and 0-byte files)."""
         if not os.path.exists(file_path):
             return False
-        if os.path.getsize(file_path) < 512:
+        size = os.path.getsize(file_path)
+        if size < 512 or size > self.max_file_size:
             return False
 
         if self.verify_pdf and file_path.lower().endswith(".pdf"):
@@ -96,6 +118,71 @@ class AegisFetch:
                 return header.startswith(b"%PDF")
         return True
 
+    def _get_with_safe_redirects(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        stream: bool = True
+    ) -> requests.Response:
+        """
+        Execute GET request while manually validating every HTTP redirect hop against SSRF.
+        """
+        current_url = validate_url(url)
+        for _ in range(MAX_REDIRECT_HOPS):
+            resp = self.session.get(
+                current_url,
+                headers=headers,
+                allow_redirects=False,
+                stream=stream,
+                timeout=25
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location") or resp.headers.get("location")
+                current_url = validate_redirect_target(current_url, loc)
+                continue
+            return resp
+
+        raise SecurityValidationError(f"Exceeded maximum redirect hops ({MAX_REDIRECT_HOPS}).")
+
+    def _stream_to_temp_file(self, resp: requests.Response, temp_path: str, is_pdf: bool) -> int:
+        """
+        Stream response chunks to disk while enforcing max_file_size and magic byte checks.
+        Prevents memory exhaustion on huge payloads.
+        """
+        # Check Content-Length header upfront if present
+        cl_header = resp.headers.get("Content-Length") or resp.headers.get("content-length")
+        if cl_header and cl_header.isdigit():
+            declared_size = int(cl_header)
+            if declared_size > self.max_file_size:
+                raise SecurityValidationError(
+                    f"Declared Content-Length ({declared_size} bytes) exceeds max allowed size ({self.max_file_size} bytes)."
+                )
+
+        total_bytes = 0
+        first_chunk_checked = False
+
+        with open(temp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                if not first_chunk_checked:
+                    first_chunk_checked = True
+                    if is_pdf and self.verify_pdf and not chunk.startswith(b"%PDF"):
+                        raise ValueError(
+                            "Received invalid payload (Likely HTML block challenge instead of PDF)"
+                        )
+                total_bytes += len(chunk)
+                if total_bytes > self.max_file_size:
+                    raise SecurityValidationError(
+                        f"Stream exceeded maximum allowed file size ({self.max_file_size} bytes). Aborting."
+                    )
+                f.write(chunk)
+
+        if total_bytes < 512:
+            raise ValueError(f"Downloaded payload too small ({total_bytes} bytes) to be a valid document.")
+
+        return total_bytes
+
     def download_file(
         self,
         url: str,
@@ -103,14 +190,14 @@ class AegisFetch:
         referer: Optional[str] = None,
         custom_headers: Optional[Dict[str, str]] = None
     ) -> DownloadResult:
-        """Download a single resource with resilience checks."""
+        """Download a single resource with full security and resilience checks."""
         if not filename:
             filename = url.split("?")[0].split("/")[-1] or "download.pdf"
             if not os.path.splitext(filename)[1]:
                 filename += ".pdf"
 
-        safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
-        final_path = os.path.join(self.output_dir, safe_filename)
+        safe_filename = sanitize_filename(filename)
+        final_path = secure_output_path(self.output_dir, safe_filename)
         temp_path = final_path + ".tmp"
 
         # Resume Check: Skip if intact file already exists
@@ -133,17 +220,18 @@ class AegisFetch:
 
         headers = {}
         if referer:
-            headers["Referer"] = referer
+            headers["Referer"] = validate_url(referer)
         if custom_headers:
             headers.update(custom_headers)
 
         last_error = None
         last_status = None
+        is_pdf = final_path.lower().endswith(".pdf")
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 self._wait_jitter()
-                resp = self.session.get(url, headers=headers, timeout=25)
+                resp = self._get_with_safe_redirects(url, headers=headers, stream=True)
                 last_status = resp.status_code
 
                 # Exponential backoff on 403 / 429
@@ -155,16 +243,7 @@ class AegisFetch:
                     continue
 
                 if resp.status_code == 200:
-                    content = resp.content
-
-                    # Validate PDF magic bytes
-                    if self.verify_pdf and final_path.lower().endswith(".pdf"):
-                        if not content.startswith(b"%PDF"):
-                            raise ValueError("Received invalid payload (Likely HTML block challenge instead of PDF)")
-
-                    # Atomic save (.tmp -> target)
-                    with open(temp_path, "wb") as f:
-                        f.write(content)
+                    total_bytes = self._stream_to_temp_file(resp, temp_path, is_pdf=is_pdf)
 
                     if os.path.exists(final_path):
                         os.remove(final_path)
@@ -176,11 +255,25 @@ class AegisFetch:
                         save_path=final_path,
                         success=True,
                         status_code=200,
-                        size_bytes=len(content)
+                        size_bytes=total_bytes
                     )
                 else:
                     last_error = f"HTTP {resp.status_code}"
 
+            except SecurityValidationError as sve:
+                # Security violations should not be retried
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+                return DownloadResult(
+                    url=url,
+                    save_path=final_path,
+                    success=False,
+                    status_code=last_status,
+                    error_msg=f"SecurityValidationError: {sve}"
+                )
             except Exception as e:
                 last_error = str(e)
                 if os.path.exists(temp_path):
@@ -188,7 +281,7 @@ class AegisFetch:
                         os.remove(temp_path)
                     except:
                         pass
-                time.sleep(2.0 * attempt)
+                time.sleep(1.5 * attempt)
 
         self.consecutive_failures += 1
         return DownloadResult(
@@ -240,37 +333,28 @@ class AegisFetch:
         print(f"✨ Finished! Total: {total} | Success: {success_count} (Skipped: {skipped_count}) | Failed: {failed_count}\n")
         return results
 
+
 # Backwards compatibility alias
 RobustDownloader = AegisFetch
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="🛡️ AegisFetch: High-resilience, Anti-403 WAF-Evading Catalog & Document Downloader"
+        description="🛡️ AegisFetch v2.0: High-resilience, Anti-403 WAF-Evading Catalog & Document Downloader"
     )
-    parser.add_argument("--urls", nargs="+", help="Target URLs to download")
-    parser.add_argument("--list-file", help="Path to text file containing URLs (one per line)")
+    parser.add_argument("--urls", nargs="+", help="Target URLs to download directly")
+    parser.add_argument("--list-file", help="Path to text file containing URLs or part numbers (one per line)")
+    parser.add_argument("--balluff-parts", nargs="+", help="BALLUFF order codes / part numbers to resolve and download (e.g. BES0002)")
+    parser.add_argument("--extract-url", help="Product web page URL from which to automatically extract and download all PDFs")
     parser.add_argument("--out-dir", default="./downloads", help="Output directory path (default: ./downloads)")
     parser.add_argument("--min-delay", type=float, default=1.0, help="Minimum jitter delay in seconds (default: 1.0)")
     parser.add_argument("--max-delay", type=float, default=2.5, help="Maximum jitter delay in seconds (default: 2.5)")
-    parser.add_argument("--proxy", help="Proxy URL (e.g., http://127.0.0.1:8080 or socks5://127.0.0.1:1080)")
+    parser.add_argument("--proxy", help="Proxy URL (e.g., http://127.0.0.1:8080)")
     parser.add_argument("--version", action="version", version=f"AegisFetch v{__version__}")
 
     args = parser.parse_args()
 
-    targets = []
-    if args.urls:
-        for u in args.urls:
-            targets.append({"url": u.strip()})
-    elif args.list_file and os.path.exists(args.list_file):
-        with open(args.list_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    targets.append({"url": line})
-    else:
-        parser.print_help()
-        sys.exit(1)
+    from extractors import CatalogExtractor
 
     fetcher = AegisFetch(
         output_dir=args.out_dir,
@@ -278,7 +362,40 @@ def main():
         max_delay=args.max_delay,
         proxy=args.proxy
     )
-    fetcher.download_batch(targets)
+
+    targets = []
+
+    if args.balluff_parts:
+        for part in args.balluff_parts:
+            try:
+                info = CatalogExtractor.resolve_balluff_part(part, session=fetcher.session)
+                targets.append(info)
+            except Exception as e:
+                print(f"[Extractor Error] {part}: {e}")
+    elif args.extract_url:
+        targets.extend(CatalogExtractor.extract_pdf_links_from_url(args.extract_url, session=fetcher.session))
+    elif args.urls:
+        for u in args.urls:
+            targets.append({"url": u.strip()})
+    elif args.list_file and os.path.exists(args.list_file):
+        with open(args.list_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    if line.lower().startswith("http"):
+                        targets.append({"url": line})
+                    else:
+                        try:
+                            info = CatalogExtractor.resolve_balluff_part(line, session=fetcher.session)
+                            targets.append(info)
+                        except Exception as e:
+                            print(f"[Extractor Error] {line}: {e}")
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    if targets:
+        fetcher.download_batch(targets)
 
 
 if __name__ == "__main__":

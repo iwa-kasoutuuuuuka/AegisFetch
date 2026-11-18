@@ -62,7 +62,7 @@ AegisFetch mitigates these issues by emulating modern browser TLS fingerprints, 
 ```bash
 git clone https://github.com/iwa-kasoutuuuuuka/AegisFetch.git
 cd AegisFetch
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ---
@@ -72,11 +72,17 @@ pip install -r requirements.txt
 ### Command Line (CLI)
 
 ```bash
-# 1. Download directly via URLs
-python aegisfetch.py --urls "https://example.com/item1.pdf" "https://example.com/item2.pdf" --out-dir "./my_catalogs"
+# 1. Download directly via URLs / URLを直接指定
+aegisfetch --urls "https://example.com/item1.pdf" "https://example.com/item2.pdf" --out-dir "./my_catalogs"
 
-# 2. Download from a list file (one URL per line)
-python aegisfetch.py --list-file "urls.txt" --out-dir "./my_catalogs" --min-delay 1.5 --max-delay 3.0
+# 2. Resolve & download by Part Numbers (e.g. BALLUFF) / 型番から自動検索＆ダウンロード
+aegisfetch --balluff-parts BES0002 BES0003 --out-dir "./my_catalogs"
+
+# 3. Extract all PDFs from a product page / 製品ページからPDFを自動抽出
+aegisfetch --extract-url "https://www.balluff.com/ja-jp/products/BES0002" --out-dir "./my_catalogs"
+
+# 4. Download from a list file (URLs or part numbers) / リストファイルから一括取得
+aegisfetch --list-file "urls.txt" --out-dir "./my_catalogs" --min-delay 1.0 --max-delay 2.5
 ```
 
 ### Python SDK
@@ -101,10 +107,10 @@ results = client.download_batch(items)
 
 ---
 
-### Model Context Protocol (MCP) Server / MCPサーバー
+### Model Context Protocol (MCP) Server / MCPサーバー (v2.0)
 
 AegisFetch includes a native MCP server for seamless integration with **Antigravity**, **Claude Code**, and **Claude Desktop**.
-Antigravity や Claude Code から直接ツール呼び出しでダウンロード・検証を実行できます。
+Antigravity や Claude Code から直接ツール呼び出しでダウンロード・型番解決・非同期バッチ処理を実行できます。
 
 #### 1. Configuration / 設定例 (`claude_desktop_config.json` / Antigravity)
 
@@ -112,10 +118,7 @@ Antigravity や Claude Code から直接ツール呼び出しでダウンロー�
 {
   "mcpServers": {
     "aegisfetch": {
-      "command": "python",
-      "args": [
-        "/path/to/AegisFetch/mcp_server.py"
-      ],
+      "command": "aegisfetch-mcp",
       "env": {
         "AEGISFETCH_DOWNLOAD_DIR": "./downloads"
       }
@@ -124,23 +127,27 @@ Antigravity や Claude Code から直接ツール呼び出しでダウンロー�
 }
 ```
 
-#### 2. Available MCP Tools / 提供ツール一覧
+#### 2. Available MCP Tools (8 Tools) / 提供ツール一覧
 
-- `aegisfetch_download_single`: Download a single document with WAF evasion and SSRF guards.
-- `aegisfetch_download_batch`: Batch download with jitter, backoff, and circuit breaker protection.
-- `aegisfetch_verify_file`: Validate local file integrity (%PDF magic byte check).
-- `aegisfetch_get_status`: Report server health, active version, and security configuration.
+- `aegisfetch_download_single`: Download a single document with WAF evasion and hop-by-hop SSRF guards.
+- `aegisfetch_download_by_part_number`: Automatically resolve part numbers (e.g. `BES0002`) into official PDF URLs and download them.
+- `aegisfetch_extract_pdf_links`: Scan a product webpage and extract all PDF links (with automatic Playwright SPA fallback).
+- `aegisfetch_download_batch`: Synchronous batch download (up to 50 items) with jitter and circuit breaker protection.
+- `aegisfetch_start_batch_job`: Start a non-blocking background job (up to 500 items) to avoid MCP 60s tool timeouts.
+- `aegisfetch_get_job_status`: Check real-time progress and results of a background download job.
+- `aegisfetch_verify_file`: Validate local file integrity (`%PDF` magic byte check).
+- `aegisfetch_get_status`: Report server health, active jobs, and active security guardrails.
 
 ---
 
-## Security & Verification / セキュリティと脆弱性対策
+## Security & Verification / セキュリティと脆弱性対策 (30/30 Tests Passing)
 
-AegisFetch is built with defensive security guardrails tested against common automation risks:
-- **SSRF Prevention**: Prohibits requests to private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata services (`169.254.169.254`).
-- **Path Traversal Defense**: Sanitizes file names and enforces output directory confinement to prevent arbitrary file overwrites.
-- **Resource Exhaustion Guards**: Enforces batch request size limits and payload size controls.
+AegisFetch v2.0 is built with deep-defense security guardrails:
+- **Direct & Open-Redirect SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) and blocks private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
+- **System Directory & Path Traversal Defense**: Blocks writes to critical OS folders (`C:\Windows`, `/etc`, Startup) and confines output paths via `os.path.commonpath`.
+- **Streamed Chunk Size Cutoff**: Streams downloads in 64KB chunks and aborts immediately if payload exceeds 100MB to prevent RAM/disk exhaustion.
 
-Run the test suite:
+Run the verification suite:
 ```bash
 python test_mcp_security.py
 ```

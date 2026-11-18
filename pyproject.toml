@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aegisfetch"
+version = "2.0.0"
+description = "High-resilience, anti-403, and WAF-evading catalog & document downloader with MCP Server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "iwa-kasoutuuuuuka"}
+]
+dependencies = [
+    "curl_cffi>=0.7.0",
+    "mcp>=2.3.0"
+]
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.40.0"
+]
+
+[project.scripts]
+aegisfetch = "aegisfetch:main"
+aegisfetch-mcp = "mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["aegisfetch", "mcp_server", "security", "extractors"]
