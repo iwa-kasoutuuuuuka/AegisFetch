@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "aegisfetch": {
+      "command": "python",
+      "args": [
+        "e:/temp/AegisFetch/mcp_server.py"
+      ],
+      "env": {
+        "AEGISFETCH_DOWNLOAD_DIR": "e:/temp/AegisFetch/downloads"
+      }
+    }
+  }
+}

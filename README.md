@@ -101,6 +101,52 @@ results = client.download_batch(items)
 
 ---
 
+### Model Context Protocol (MCP) Server / MCPサーバー
+
+AegisFetch includes a native MCP server for seamless integration with **Antigravity**, **Claude Code**, and **Claude Desktop**.
+Antigravity や Claude Code から直接ツール呼び出しでダウンロード・検証を実行できます。
+
+#### 1. Configuration / 設定例 (`claude_desktop_config.json` / Antigravity)
+
+```json
+{
+  "mcpServers": {
+    "aegisfetch": {
+      "command": "python",
+      "args": [
+        "/path/to/AegisFetch/mcp_server.py"
+      ],
+      "env": {
+        "AEGISFETCH_DOWNLOAD_DIR": "./downloads"
+      }
+    }
+  }
+}
+```
+
+#### 2. Available MCP Tools / 提供ツール一覧
+
+- `aegisfetch_download_single`: Download a single document with WAF evasion and SSRF guards.
+- `aegisfetch_download_batch`: Batch download with jitter, backoff, and circuit breaker protection.
+- `aegisfetch_verify_file`: Validate local file integrity (%PDF magic byte check).
+- `aegisfetch_get_status`: Report server health, active version, and security configuration.
+
+---
+
+## Security & Verification / セキュリティと脆弱性対策
+
+AegisFetch is built with defensive security guardrails tested against common automation risks:
+- **SSRF Prevention**: Prohibits requests to private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata services (`169.254.169.254`).
+- **Path Traversal Defense**: Sanitizes file names and enforces output directory confinement to prevent arbitrary file overwrites.
+- **Resource Exhaustion Guards**: Enforces batch request size limits and payload size controls.
+
+Run the test suite:
+```bash
+python test_mcp_security.py
+```
+
+---
+
 ## Options / 設定オプション
 
 | Option | Default | Description (EN / JA) |
