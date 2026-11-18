@@ -80,7 +80,8 @@ def download_single(
             output_dir=target_dir,
             min_delay=0.5,
             max_delay=1.2,
-            verify_pdf=verify_pdf
+            verify_pdf=verify_pdf,
+            quiet=True
         )
 
         result = fetcher.download_file(
@@ -146,7 +147,7 @@ def download_by_part_number(
         target_dir = validate_output_directory(output_dir or DEFAULT_BASE_DIR)
         os.makedirs(target_dir, exist_ok=True)
 
-        fetcher = AegisFetch(output_dir=target_dir, min_delay=0.5, max_delay=1.2)
+        fetcher = AegisFetch(output_dir=target_dir, min_delay=0.5, max_delay=1.2, quiet=True)
         results = []
         errors = []
 
@@ -265,7 +266,8 @@ def download_batch(
         output_dir=target_dir,
         min_delay=max(0.4, min_delay),
         max_delay=max(0.8, max_delay),
-        verify_pdf=verify_pdf
+        verify_pdf=verify_pdf,
+        quiet=True
     )
 
     results = fetcher.download_batch(validated_targets)
@@ -302,52 +304,54 @@ def _run_background_job(
     max_delay: float
 ):
     """Worker thread function for non-blocking large batch downloads."""
-    fetcher = AegisFetch(output_dir=target_dir, min_delay=min_delay, max_delay=max_delay)
+    try:
+        fetcher = AegisFetch(output_dir=target_dir, min_delay=min_delay, max_delay=max_delay, quiet=True)
 
-    for idx, item in enumerate(items, 1):
-        try:
-            if is_part_numbers and not item.lower().startswith("http"):
-                resolved = CatalogExtractor.resolve_balluff_part(item, session=fetcher.session)
-                res = fetcher.download_file(
-                    url=resolved["url"],
-                    filename=resolved["filename"],
-                    referer=resolved["referer"]
-                )
-            else:
-                safe_u = validate_url(item)
-                fname = sanitize_filename(safe_u.split("?")[0].split("/")[-1])
-                res = fetcher.download_file(url=safe_u, filename=fname)
+        for idx, item in enumerate(items, 1):
+            try:
+                if is_part_numbers and not item.lower().startswith("http"):
+                    resolved = CatalogExtractor.resolve_balluff_part(item, session=fetcher.session)
+                    res = fetcher.download_file(
+                        url=resolved["url"],
+                        filename=resolved["filename"],
+                        referer=resolved["referer"]
+                    )
+                else:
+                    safe_u = validate_url(item)
+                    fname = sanitize_filename(safe_u.split("?")[0].split("/")[-1])
+                    res = fetcher.download_file(url=safe_u, filename=fname)
 
-            entry = {
-                "item": item,
-                "saved_path": res.save_path,
-                "success": res.success,
-                "skipped": res.skipped,
-                "size_kb": round(res.size_bytes / 1024, 2),
-                "error": res.error_msg
-            }
-        except Exception as e:
-            entry = {
-                "item": item,
-                "saved_path": None,
-                "success": False,
-                "skipped": False,
-                "size_kb": 0,
-                "error": str(e)
-            }
+                entry = {
+                    "item": item,
+                    "saved_path": res.save_path,
+                    "success": res.success,
+                    "skipped": res.skipped,
+                    "size_kb": round(res.size_bytes / 1024, 2),
+                    "error": res.error_msg
+                }
+            except Exception as e:
+                entry = {
+                    "item": item,
+                    "saved_path": None,
+                    "success": False,
+                    "skipped": False,
+                    "size_kb": 0,
+                    "error": str(e)
+                }
 
+            with _JOBS_LOCK:
+                job = _BACKGROUND_JOBS[job_id]
+                job["completed_items"] = idx
+                job["results"].append(entry)
+                if entry["success"]:
+                    job["success_count"] += 1
+                else:
+                    job["failed_count"] += 1
+    finally:
         with _JOBS_LOCK:
-            job = _BACKGROUND_JOBS[job_id]
-            job["completed_items"] = idx
-            job["results"].append(entry)
-            if entry["success"]:
-                job["success_count"] += 1
-            else:
-                job["failed_count"] += 1
-
-    with _JOBS_LOCK:
-        _BACKGROUND_JOBS[job_id]["status"] = "completed"
-        _BACKGROUND_JOBS[job_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            if job_id in _BACKGROUND_JOBS:
+                _BACKGROUND_JOBS[job_id]["status"] = "completed"
+                _BACKGROUND_JOBS[job_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 @server.tool(

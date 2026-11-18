@@ -85,14 +85,14 @@ class CatalogExtractor:
     @staticmethod
     def parse_balluff_code(raw_input: str) -> Tuple[str, str]:
         """
-        Parse strings like 'BES0002(BES G06EB-NOC40F-S49G)' or 'BES0002'
+        Parse strings like 'BES0002(BES G06EB-NOC40F-S49G)' or 'BES0002 (BES ...)'
         into (order_code, full_filename).
         """
         raw = raw_input.strip()
-        m = re.match(r"^([A-Z0-9]{7})(?:\((.*?)\))?", raw, re.I)
+        m = re.match(r"^([A-Z0-9]{7})\s*(?:\((.*?)\))?", raw, re.I)
         if m:
             order_code = m.group(1).upper()
-            part_desc = m.group(2) or ""
+            part_desc = (m.group(2) or "").strip()
             safe_desc = re.sub(r"[^a-zA-Z0-9_\-]", "_", part_desc).strip("_")
             fname = f"{order_code}_{safe_desc}.pdf" if safe_desc else f"{order_code}.pdf"
             return order_code, fname

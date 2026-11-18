@@ -144,9 +144,11 @@ def test_system_dir_and_path_traversal():
 def test_extractor_and_background_jobs():
     print("\n--- 4. Testing Extractor Engine & Background Job Queue ---")
 
-    # 1. Test BALLUFF part code parser
+    # 1. Test BALLUFF part code parser (with and without space before parenthesis)
     code, fname = CatalogExtractor.parse_balluff_code("BES0002(BES G06EB-NOC40F-S49G)")
     record_test("Extractor parses order code & filename", code == "BES0002" and "BES0002" in fname)
+    code2, fname2 = CatalogExtractor.parse_balluff_code("BES0002 (BES G06EB-NOC40F-S49G)")
+    record_test("Extractor handles whitespace before parenthesis", fname2 == "BES0002_BES_G06EB-NOC40F-S49G.pdf")
 
     # 2. Test live PDF link extraction from product page
     links_raw = extract_pdf_links("https://www.balluff.com/ja-jp/products/BES0002", use_playwright_fallback=False)
@@ -200,12 +202,13 @@ def test_extractor_and_background_jobs():
 
 async def main():
     print("==================================================================")
-    print("   AegisFetch v2.0 - Full Security, Extractor & Job Test Suite")
+    print("   AegisFetch v2.0.1 - Full Security, Extractor & Job Test Suite")
     print("==================================================================")
     await test_mcp_registration()
     test_ssrf_and_redirect_vulnerabilities()
     test_system_dir_and_path_traversal()
     test_extractor_and_background_jobs()
+    test_stdio_jsonrpc_integrity()
 
     print("\n========================== TEST SUMMARY ==========================")
     print(f"Total Passed: {passed_tests}")
@@ -213,6 +216,53 @@ async def main():
     print("==================================================================")
     if failed_tests > 0:
         sys.exit(1)
+
+
+def test_stdio_jsonrpc_integrity():
+    print("\n--- 5. Testing MCP Stdio JSON-RPC Protocol Purity ---")
+    import io
+    import subprocess
+
+    # Verify zero stdout pollution during tool execution
+    buf = io.StringIO()
+    old_out = sys.stdout
+    sys.stdout = buf
+    try:
+        get_status()
+    finally:
+        sys.stdout = old_out
+    record_test("Zero stdout pollution during MCP tool calls", len(buf.getvalue()) == 0)
+
+    # Verify real subprocess stdio JSON-RPC initialize handshake
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath("e:/temp/AegisFetch/mcp_server.py")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test-suite", "version": "1.0.0"},
+            },
+        }
+        proc.stdin.write(json.dumps(req) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        resp = json.loads(line)
+        record_test(
+            "Subprocess stdio JSON-RPC handshake valid",
+            resp.get("id") == 1 and resp.get("result", {}).get("serverInfo", {}).get("name") == "AegisFetch",
+        )
+    finally:
+        proc.terminate()
 
 
 if __name__ == "__main__":
