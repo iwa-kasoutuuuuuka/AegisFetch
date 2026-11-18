@@ -69,7 +69,20 @@ pip install -e .
 
 ## Usage / 使い方
 
-### Command Line (CLI)
+### 1. Web UI Console (Browser GUI) / ブラウザ操作画面
+
+Launch the interactive Web UI dashboard (automatically opens `http://127.0.0.1:8765` in your browser):
+ブラウザから直感的に型番リストの貼り付け・ページ内PDF抽出・リアルタイム進捗確認・PDF閲覧ができる Web UI モードを起動します：
+
+```bash
+# Command line launch / コマンドで起動
+aegisfetch-ui
+
+# Or double-click on Windows / またはバッチファイルをダブルクリック
+Start_AegisFetch_WebUI.bat
+```
+
+### 2. Command Line (CLI)
 
 ```bash
 # 1. Download directly via URLs / URLを直接指定

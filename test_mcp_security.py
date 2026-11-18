@@ -209,6 +209,7 @@ async def main():
     test_system_dir_and_path_traversal()
     test_extractor_and_background_jobs()
     test_stdio_jsonrpc_integrity()
+    test_web_ui_endpoints()
 
     print("\n========================== TEST SUMMARY ==========================")
     print(f"Total Passed: {passed_tests}")
@@ -263,6 +264,86 @@ def test_stdio_jsonrpc_integrity():
         )
     finally:
         proc.terminate()
+
+
+def test_web_ui_endpoints():
+    print("\n--- 6. Testing Web UI Dashboard Server & API Security ---")
+    import threading
+    import shutil
+    import urllib.request
+    import urllib.error
+    from http.server import ThreadingHTTPServer
+    from web_ui import AegisWebRequestHandler
+
+    ui_server = ThreadingHTTPServer(("127.0.0.1", 18765), AegisWebRequestHandler)
+    t = threading.Thread(target=ui_server.serve_forever, daemon=True)
+    t.start()
+    base_url = "http://127.0.0.1:18765"
+    test_dir = "e:/temp/test_webui_dl"
+
+    try:
+        # 1. Dashboard HTML
+        with urllib.request.urlopen(base_url + "/") as r:
+            html_text = r.read().decode("utf-8")
+            record_test("Web UI GET / serves HTML dashboard", r.status == 200 and "AegisFetch Web Console" in html_text)
+
+        # 2. Icon SVG
+        with urllib.request.urlopen(base_url + "/assets/icon.svg") as r:
+            svg_bytes = r.read()
+            record_test("Web UI GET /assets/icon.svg serves SVG", r.status == 200 and b"<svg" in svg_bytes)
+
+        # 3. Security check on forbidden output_dir
+        req_forbidden = urllib.request.Request(
+            base_url + "/api/start",
+            data=json.dumps({"items": ["BES0002"], "output_dir": "C:\\Windows\\System32"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        blocked_403 = False
+        try:
+            urllib.request.urlopen(req_forbidden)
+        except urllib.error.HTTPError as e:
+            blocked_403 = (e.code == 403)
+        record_test("Web UI POST /api/start blocks System32 with HTTP 403", blocked_403)
+
+        # 4. Launch real download job from Web UI
+        req_dl = urllib.request.Request(
+            base_url + "/api/start",
+            data=json.dumps({"items": ["BES0002"], "output_dir": test_dir, "min_delay": 0.3, "max_delay": 0.5}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req_dl) as r:
+            start_data = json.loads(r.read().decode("utf-8"))
+            job_id = start_data.get("job_id")
+            record_test("Web UI POST /api/start launches download job", start_data.get("success") is True and bool(job_id))
+
+        job_state = {}
+        for _ in range(25):
+            with urllib.request.urlopen(f"{base_url}/api/job?job_id={job_id}") as r:
+                job_state = json.loads(r.read().decode("utf-8"))
+                if job_state.get("status") == "completed":
+                    break
+            time.sleep(0.5)
+
+        record_test(
+            "Web UI GET /api/job completes download",
+            job_state.get("status") == "completed" and job_state.get("success_count") == 1,
+        )
+
+        # 5. List and serve downloaded PDF via Web UI
+        with urllib.request.urlopen(f"{base_url}/api/files?dir={test_dir}") as r:
+            fdata = json.loads(r.read().decode("utf-8"))
+            files = fdata.get("files", [])
+            record_test("Web UI GET /api/files lists downloaded PDF", len(files) == 1)
+            fname = files[0]["name"]
+
+        with urllib.request.urlopen(f"{base_url}/files/{fname}?dir={test_dir}") as r:
+            pdf_bytes = r.read()
+            record_test("Web UI GET /files/<name> streams valid PDF", pdf_bytes.startswith(b"%PDF"))
+
+    finally:
+        ui_server.shutdown()
+        ui_server.server_close()
+        shutil.rmtree(test_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

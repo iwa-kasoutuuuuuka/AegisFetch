@@ -25,6 +25,7 @@ browser = [
 [project.scripts]
 aegisfetch = "aegisfetch:main"
 aegisfetch-mcp = "mcp_server:main"
+aegisfetch-ui = "web_ui:main"
 
 [tool.setuptools]
-py-modules = ["aegisfetch", "mcp_server", "security", "extractors"]
+py-modules = ["aegisfetch", "mcp_server", "security", "extractors", "web_ui"]
