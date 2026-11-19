@@ -212,6 +212,24 @@ python test_mcp_security.py
 
 ---
 
+## Changelog / 更新履歴
+
+- **v2.2.1**:
+  - Fixed Open-Redirect SSRF vector in revision-check `HEAD` requests via shared hop-by-hop validator.
+  - Added `.xlsx` ZIP decompression bomb protection (20MB uncompressed cap, 5,000-row scan limit).
+  - Fixed false-positive revision updates on dynamic PDF engines where `Last-Modified` mirrors server `Date`.
+  - Upgraded file replacement to thread-safe atomic `os.replace()` and added safe POST body draining on early HTTP 403 to prevent Windows TCP RST.
+- **v2.2.0**:
+  - Added Web UI Excel (`.xlsx`) / CSV / TXT Drag & Drop BOM importer, One-Click Retry Failed, multi-locale auto-fallback (`ja-jp` ➔ `en-us` ➔ `de-de`), multi-threaded parallel downloads (`concurrency=1..8`), cross-vendor datasheet search, and catalog revision tracking (`--check-updates`).
+- **v2.1.1**:
+  - Added Proxy-based SSRF prevention, automatic proxy credential masking (`***:***`), and Web UI CSRF / DNS Rebinding defenses.
+- **v2.1.0**:
+  - Added Multi-Proxy IP Rotation (Round-Robin / Random), Free Public Proxy Harvester with Cloudflare HTTPS trace verification, and Web UI proxy console.
+- **v2.0.0**:
+  - Added native MCP Server (`aegisfetch-mcp`), Web UI console (`aegisfetch-ui`), Extractor Engine, non-blocking Background Job Queue, and deep-defense security suite.
+
+---
+
 ## License
 
 MIT License - Copyright (c) 2026 iwa-kasoutuuuuuka
