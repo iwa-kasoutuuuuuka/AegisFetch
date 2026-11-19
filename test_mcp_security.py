@@ -213,7 +213,7 @@ def test_extractor_and_background_jobs():
 
 async def main():
     print("==================================================================")
-    print("   AegisFetch v2.2.1 - Full Security, Proxy & Web UI Test Suite")
+    print("   AegisFetch v2.4.0 - Full Security, Proxy & Web UI Test Suite")
     print("==================================================================")
     await test_mcp_registration()
     test_ssrf_and_redirect_vulnerabilities()
@@ -222,6 +222,7 @@ async def main():
     test_stdio_jsonrpc_integrity()
     test_web_ui_endpoints()
     test_v22_advanced_features()
+    test_chrome_extension_and_bridge()
 
     print("\n========================== TEST SUMMARY ==========================")
     print(f"Total Passed: {passed_tests}")
@@ -545,6 +546,179 @@ def test_v22_advanced_features():
         f"Web UI job registry prunes completed jobs to <= {MAX_RETAINED_UI_JOBS}",
         pruned_count == MAX_RETAINED_UI_JOBS
     )
+
+
+def test_chrome_extension_and_bridge():
+    print("\n--- 8. Testing Chrome / Edge Extension (MV3) & Local Bridge Security ---")
+    import re
+    import struct
+    import shutil
+    import threading
+    import urllib.request
+    import urllib.error
+    from http.server import ThreadingHTTPServer
+    import web_ui
+
+    ext_dir = os.path.join(BASE_DIR, "chrome_extension")
+    manifest_path = os.path.join(ext_dir, "manifest.json")
+    popup_html_path = os.path.join(ext_dir, "popup.html")
+    popup_js_path = os.path.join(ext_dir, "popup.js")
+    bg_js_path = os.path.join(ext_dir, "background.js")
+
+    # 1. Manifest V3 structure & least-privilege audit
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    perms = set(manifest.get("permissions", []))
+    hosts = manifest.get("host_permissions", [])
+    expected_perms = {"activeTab", "scripting", "contextMenus", "storage"}
+    hosts_only_local = all(
+        h.startswith("http://127.0.0.1:8765/") or h.startswith("http://localhost:8765/")
+        for h in hosts
+    ) and len(hosts) >= 2
+    csp_str = (manifest.get("content_security_policy") or {}).get("extension_pages", "")
+
+    record_test("Manifest V3 version == 3", manifest.get("manifest_version") == 3)
+    record_test(
+        "Manifest uses least-privilege permissions (no <all_urls>/cookies)",
+        perms == expected_perms and "<all_urls>" not in hosts and "cookies" not in perms
+    )
+    record_test("Manifest host_permissions restricted strictly to local bridge", hosts_only_local)
+    record_test("Manifest CSP restricts script-src 'self' & object-src 'none'", "'self'" in csp_str and "'none'" in csp_str)
+
+    # 2. PNG Icons verification via raw IHDR header parsing (no PIL required in CI)
+    for sz in (16, 48, 128):
+        icon_path = os.path.join(ext_dir, "icons", f"icon{sz}.png")
+        ok_icon = False
+        if os.path.exists(icon_path):
+            with open(icon_path, "rb") as f:
+                data = f.read()
+            if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+                w, h = struct.unpack(">II", data[16:24])
+                ok_icon = (w == sz and h == sz)
+        record_test(f"Extension icon{sz}.png valid PNG ({sz}x{sz})", ok_icon)
+
+    # 3. Static XSS & MV3 CSP compliance audit on popup.html, popup.js, background.js
+    with open(popup_html_path, "r", encoding="utf-8") as f:
+        popup_html = f.read()
+    has_inline_handler = bool(re.search(r"\bon[a-z]+\s*=", popup_html, re.I))
+    inline_scripts = [
+        m.group(1).strip()
+        for m in re.finditer(r"<script\b[^>]*>(.*?)</script>", popup_html, re.I | re.S)
+    ]
+    has_inline_script_body = any(bool(s) for s in inline_scripts)
+    record_test(
+        "popup.html obeys MV3 CSP (no inline handlers or inline script bodies)",
+        (not has_inline_handler) and (not has_inline_script_body)
+    )
+
+    for js_name, js_path in (("popup.js", popup_js_path), ("background.js", bg_js_path)):
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        unsafe_sink = (
+            ".innerHTML" in js_src
+            or bool(re.search(r"\beval\s*\(", js_src))
+            or "document.write(" in js_src
+        )
+        record_test(f"{js_name} has no unsafe XSS sinks (innerHTML/eval/document.write)", not unsafe_sink)
+
+    # 4. Local Bridge Security & Extension Auth Tests
+    bridge_server = ThreadingHTTPServer(("127.0.0.1", 18766), web_ui.AegisWebRequestHandler)
+    bt = threading.Thread(target=bridge_server.serve_forever, daemon=True)
+    bt.start()
+    bridge_url = "http://127.0.0.1:18766"
+    ext_origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ref_dir = os.path.join(TMP_ROOT, "test_ext_bridge_dl")
+
+    def _req_status(method, path, headers=None, json_body=None):
+        data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+        req = urllib.request.Request(bridge_url + path, data=data, method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req) as r:
+                raw = r.read().decode("utf-8")
+                return r.status, dict(r.headers), json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8")
+            return e.code, dict(e.headers), json.loads(raw) if raw else {}
+
+    try:
+        # 4a. GET /api/health with ext origin & NO token -> 403
+        st, _, _ = _req_status("GET", "/api/health", headers={"Origin": ext_origin})
+        record_test("Bridge GET /api/health rejects extension origin without token (403)", st == 403)
+
+        # 4b. GET /api/health with ext origin & WRONG token -> 403
+        st, _, _ = _req_status("GET", "/api/health", headers={"Origin": ext_origin, "X-Aegis-Token": "wrong_token"})
+        record_test("Bridge GET /api/health rejects extension origin with wrong token (403)", st == 403)
+
+        # 4c. GET /api/health with ext origin & VALID token -> 200 + CORS header
+        st, hdrs, body = _req_status(
+            "GET",
+            "/api/health",
+            headers={"Origin": ext_origin, "X-Aegis-Token": web_ui.EXTENSION_TOKEN},
+        )
+        acao = hdrs.get("Access-Control-Allow-Origin")
+        record_test(
+            "Bridge GET /api/health allows authenticated extension (200 + exact ACAO)",
+            st == 200 and body.get("status") == "ok" and acao == ext_origin
+        )
+
+        # 4d. POST /api/start with ext origin & NO token -> 403
+        st, _, _ = _req_status(
+            "POST",
+            "/api/start",
+            headers={"Origin": ext_origin, "Content-Type": "application/json"},
+            json_body={"items": ["BES0002"], "output_dir": ref_dir},
+        )
+        record_test("Bridge POST /api/start rejects extension without token (403)", st == 403)
+
+        # 4e. POST /api/start with external web Origin AND valid token -> 403 (defense in depth)
+        st, _, _ = _req_status(
+            "POST",
+            "/api/start",
+            headers={
+                "Origin": "https://evil-attacker.com",
+                "Content-Type": "application/json",
+                "X-Aegis-Token": web_ui.EXTENSION_TOKEN,
+            },
+            json_body={"items": ["BES0002"], "output_dir": ref_dir},
+        )
+        record_test("Bridge POST /api/start rejects external web Origin even with valid token (403)", st == 403)
+
+        # 4f. OPTIONS /api/start preflight with valid extension Origin -> 204 + X-Aegis-Token allowed
+        st, hdrs, _ = _req_status("OPTIONS", "/api/start", headers={"Origin": ext_origin})
+        allow_hdrs = hdrs.get("Access-Control-Allow-Headers", "")
+        record_test(
+            "Bridge OPTIONS /api/start grants CORS preflight for extension (204)",
+            st == 204 and "X-Aegis-Token" in allow_hdrs and hdrs.get("Access-Control-Allow-Origin") == ext_origin
+        )
+
+        # 4g. OPTIONS /api/start preflight with external web Origin -> 403
+        st, _, _ = _req_status("OPTIONS", "/api/start", headers={"Origin": "https://evil-attacker.com"})
+        record_test("Bridge OPTIONS /api/start blocks external web Origin preflight (403)", st == 403)
+
+        # 4h. POST /api/start with valid ext Origin + valid token + SSRF page_referer -> 403
+        st, _, body = _req_status(
+            "POST",
+            "/api/start",
+            headers={
+                "Origin": ext_origin,
+                "Content-Type": "application/json",
+                "X-Aegis-Token": web_ui.EXTENSION_TOKEN,
+            },
+            json_body={
+                "items": ["https://example.com/test.pdf"],
+                "output_dir": ref_dir,
+                "page_referer": "http://127.0.0.1/secret",
+            },
+        )
+        record_test(
+            "Bridge POST /api/start blocks SSRF internal IP in page_referer (403)",
+            st == 403 and body.get("success") is False
+        )
+    finally:
+        bridge_server.shutdown()
+        bridge_server.server_close()
+        shutil.rmtree(ref_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

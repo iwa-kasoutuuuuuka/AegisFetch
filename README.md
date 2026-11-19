@@ -82,7 +82,25 @@ aegisfetch-ui
 Start_AegisFetch_WebUI.bat
 ```
 
-### 2. Command Line (CLI)
+### 2. Chrome / Edge Extension (`AegisFetch Companion` - v2.4.0) / Chrome・Edge 拡張機能
+
+Send PDF links and selected part numbers directly from your everyday Chrome/Edge browser (even on login-protected or JS-rendered pages) to your local AegisFetch server:
+普段お使いの Chrome / Edge で開いているページ（要ログイン会員サイトや JS 動的ページを含む）から、ワンクリックや右クリックメニューで AegisFetch にダウンロードを送信できます：
+
+1. **Start Web UI / Web UI 起動**: Launch `aegisfetch-ui` (or `Start_AegisFetch_WebUI.bat`).
+2. **Load Extension / 拡張機能の読み込み (約30秒)**:
+   - Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode / デベロッパー モード**.
+   - Click **Load unpacked / パッケージ化されていない拡張機能を読み込む** and select the `chrome_extension/` folder.
+3. **Token Pairing / トークン連携**:
+   - Click **`🔑 拡張トークンをコピー`** in the Web UI header.
+   - Open the **AegisFetch Companion** popup (`⚙️`) and paste the token to connect securely.
+
+**Capabilities / 主な機能**:
+- **Auto-Scan Active Tab**: Detects `.pdf` / `pdfengine` / datasheet links inside the active page and lets you pick items with checkboxes.
+- **Right-Click Context Menu**: Highlight any part number (e.g., `BES0002`) or right-click a link ➔ **`🛡️ AegisFetch で取得`**.
+- **Strict Least-Privilege Security**: Uses `activeTab` only (no `<all_urls>` spy permissions), strict MV3 CSP (`script-src 'self'`), and `X-Aegis-Token` + `chrome-extension://` Origin verification.
+
+### 3. Command Line (CLI)
 
 ```bash
 # 1. Download directly via URLs / URLを直接指定
@@ -180,10 +198,11 @@ AegisFetch v2.2 supports switching proxy IP on **every single file download** (R
 
 ---
 
-## Security & Verification / セキュリティと脆弱性対策 (64/64 Tests Passing)
+## Security & Verification / セキュリティと脆弱性対策 (82/82 Tests Passing)
 
-AegisFetch v2.3.0 is built with deep-defense security guardrails audited across 64 automated tests (including GitHub Actions CI across Ubuntu & Windows):
-- **Direct, Open-Redirect (GET & HEAD) & Proxy-based SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) for both GET and revision-check HEAD requests as well as proxy targets, blocking private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
+AegisFetch v2.4.0 is built with deep-defense security guardrails audited across 82 automated tests (71 offline checks across Ubuntu & Windows GitHub Actions CI):
+- **Browser Extension Local Bridge Security**: Enforces `X-Aegis-Token` (`hmac.compare_digest`), strict `chrome-extension://` Origin + local Host validation, CORS preflight gating, strict MV3 CSP (`script-src 'self'`), zero unsafe DOM sinks (`textContent`-only), and `activeTab` least privilege.
+- **Direct, Open-Redirect (GET & HEAD) & Proxy-based SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) for both GET and revision-check HEAD requests, `page_referer`, and proxy targets, blocking private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
 - **XLSX ZIP Decompression Bomb Defense**: Pre-inspects uncompressed ZIP entry sizes in uploaded `.xlsx` BOM files (20MB cap, 5,000-row scan limit) before parsing.
 - **Web UI CSRF & DNS Rebinding Protection**: Strictly validates `Host` and `Origin` headers on local Web UI API endpoints (`127.0.0.1` / `localhost` only) and enforces `X-Frame-Options: DENY` & `X-Content-Type-Options: nosniff`.
 - **System Directory & Path Traversal Defense**: Blocks writes to critical OS folders (`C:\Windows`, `/etc`, Startup) and confines output paths via `os.path.commonpath`.
@@ -216,6 +235,10 @@ python test_mcp_security.py
 
 ## Changelog / 更新履歴
 
+- **v2.4.0**:
+  - Added **AegisFetch Companion** Chrome / Edge extension (`chrome_extension/`, Manifest V3) with active-tab PDF scanner, right-click context menus (selection part numbers & links), live job progress bar, and PNG icons (`16x16`, `48x48`, `128x128`).
+  - Upgraded `web_ui.py` local bridge with persistent `X-Aegis-Token` auth, strict `chrome-extension://` CORS & preflight handling, `GET /api/health`, `page_referer` SSRF validation in `POST /api/start`, and header token copy button.
+  - Added 18 automated MV3 manifest, icon, XSS/CSP, and bridge auth/CORS/SSRF tests (82/82 online, 71/71 offline CI).
 - **v2.3.1**:
   - Fixed cross-platform system directory validation (`C:\Windows` checks on Ubuntu Linux CI) and Python 3.12 docstring escape warning.
   - Added CSV / Excel Formula Injection protection (`=`, `+`, `-`, `@`) to Web UI report exports.

@@ -18,12 +18,15 @@ Security:
 
 import os
 import io
+import re
 import csv
 import sys
+import hmac
 import uuid
 import time
 import json
 import base64
+import secrets
 import zipfile
 import threading
 import webbrowser
@@ -32,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote, parse_qs
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from aegisfetch import AegisFetch, __version__
 from extractors import CatalogExtractor
@@ -48,6 +51,37 @@ from security import (
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_DOWNLOAD_DIR = os.path.abspath(os.environ.get("AEGISFETCH_DOWNLOAD_DIR", "./downloads"))
+
+
+def _load_or_create_extension_token() -> str:
+    """
+    Load extension authentication token from env or ~/.aegisfetch_token,
+    or generate a new random token and persist it locally.
+    """
+    env_tok = os.environ.get("AEGISFETCH_EXTENSION_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+
+    token_path = os.path.join(os.path.expanduser("~"), ".aegisfetch_token")
+    if os.path.exists(token_path):
+        try:
+            with open(token_path, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+                if existing:
+                    return existing
+        except OSError:
+            pass
+
+    new_tok = secrets.token_urlsafe(24)
+    try:
+        with open(token_path, "w", encoding="utf-8") as f:
+            f.write(new_tok)
+    except OSError:
+        pass
+    return new_tok
+
+
+EXTENSION_TOKEN = _load_or_create_extension_token()
 
 _UI_JOBS_LOCK = threading.Lock()
 _UI_JOBS: Dict[str, Dict[str, Any]] = {}
@@ -162,6 +196,7 @@ def _run_ui_download_job(
     proxies: Optional[List[str]] = None,
     proxy_rotation_mode: str = "round_robin",
     fallback_to_direct: bool = True,
+    page_referer: Optional[str] = None,
 ):
     """Background worker for Web UI batch downloads with parallelism, proxy rotation & cancellation."""
     try:
@@ -192,7 +227,7 @@ def _run_ui_download_job(
                     fname = sanitize_filename(safe_u.split("?")[0].split("/")[-1])
                     if verify_pdf and not fname.lower().endswith(".pdf"):
                         fname += ".pdf"
-                    res = fetcher.download_file(url=safe_u, filename=fname)
+                    res = fetcher.download_file(url=safe_u, filename=fname, referer=page_referer)
                     resolved_url = safe_u
                     source_tag = "direct_url"
                 else:
@@ -496,7 +531,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <div class="brand">
     <img src="/assets/icon.svg" alt="AegisFetch" />
     <div class="brand-title">
-      <h1>AegisFetch Web Console v2.2</h1>
+      <h1>AegisFetch Web Console v__VERSION__</h1>
       <p>Anti-403 WAF-Evading Catalog Downloader, BOM Importer &amp; Multi-Proxy IP Rotator</p>
     </div>
   </div>
@@ -504,6 +539,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <span class="badge">TLS: Chrome124 / Safari</span>
     <span class="badge badge-purple" id="headerProxyBadge">Proxy: DIRECT</span>
     <span class="badge">SSRF &amp; CSRF Guard: ACTIVE</span>
+    <button class="btn-secondary" style="padding:4px 10px; font-size:0.74rem;" onclick="copyExtensionToken()">🔑 拡張トークンをコピー</button>
   </div>
 </header>
 
@@ -696,10 +732,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 </div>
 
 <script>
+  const EXTENSION_TOKEN = "__EXTENSION_TOKEN__";
   let activeJobId = null;
   let pollTimer = null;
   let lastFailedItems = [];
   let lastJobResults = [];
+
+  function copyExtensionToken() {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(EXTENSION_TOKEN).then(() => {
+        alert("拡張機能連携用トークンをクリップボードにコピーしました！\\nChrome拡張の設定画面に貼り付けてください。");
+      }).catch(() => {
+        window.prompt("AegisFetch 拡張機能トークン (コピーしてください):", EXTENSION_TOKEN);
+      });
+    } else {
+      window.prompt("AegisFetch 拡張機能トークン (コピーしてください):", EXTENSION_TOKEN);
+    }
+  }
 
   const SETTINGS_KEYS = [
     'outputDir', 'proxiesInput', 'proxyModeSelect', 'concurrencySelect',
@@ -1153,24 +1202,50 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
 
 class AegisWebRequestHandler(BaseHTTPRequestHandler):
-    """HTTP Handler for AegisFetch Web UI Console with CSRF & DNS Rebinding Protection."""
+    """HTTP Handler for AegisFetch Web UI Console with CSRF, DNS Rebinding & Extension Token Auth."""
+
+    _EXT_ORIGIN_RE = re.compile(r"^(chrome-extension|extension)://[a-z0-9]{16,64}$", re.I)
 
     def log_message(self, format: str, *args: Any):
         pass
 
-    def _is_safe_local_request(self, is_post: bool = False) -> bool:
+    def _is_valid_local_host(self) -> bool:
         host = (self.headers.get("Host") or "").lower().strip()
         host_only = host.split(":")[0]
-        if host_only not in ("127.0.0.1", "localhost", "[::1]", ""):
-            return False
+        return host_only in ("127.0.0.1", "localhost", "[::1]", "")
 
-        if is_post:
-            origin = (self.headers.get("Origin") or "").lower().strip()
-            if origin:
-                parsed_orig = urlparse(origin)
-                if parsed_orig.hostname not in ("127.0.0.1", "localhost", "::1"):
-                    return False
-        return True
+    def _get_validated_extension_origin(self) -> Optional[str]:
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and self._EXT_ORIGIN_RE.match(origin):
+            return origin
+        return None
+
+    def _has_valid_extension_token(self) -> bool:
+        provided = (self.headers.get("X-Aegis-Token") or "").strip()
+        return bool(provided) and hmac.compare_digest(provided, EXTENSION_TOKEN)
+
+    def _check_local_request(self, is_post: bool = False) -> Tuple[bool, str]:
+        if not self._is_valid_local_host():
+            return False, "Forbidden Host header (DNS Rebinding Protection)."
+
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True, ""
+
+        if self._EXT_ORIGIN_RE.match(origin):
+            if self._has_valid_extension_token():
+                return True, ""
+            return False, "Invalid or missing X-Aegis-Token header for browser extension."
+
+        parsed_orig = urlparse(origin)
+        if parsed_orig.hostname in ("127.0.0.1", "localhost", "::1"):
+            return True, ""
+
+        return False, "Forbidden Origin/Host header (CSRF & DNS Rebinding Protection)."
+
+    def _is_safe_local_request(self, is_post: bool = False) -> bool:
+        ok, _ = self._check_local_request(is_post=is_post)
+        return ok
 
     def _send_json(self, data: Dict[str, Any], status: int = 200):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -1180,6 +1255,10 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        ext_origin = self._get_validated_extension_origin()
+        if ext_origin:
+            self.send_header("Access-Control-Allow-Origin", ext_origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(raw)
 
@@ -1190,9 +1269,24 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
 
+    def do_OPTIONS(self):
+        ext_origin = self._get_validated_extension_origin()
+        if self._is_valid_local_host() and ext_origin:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Access-Control-Allow-Origin", ext_origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Aegis-Token")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Vary", "Origin")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self._send_json({"success": False, "message": "Forbidden CORS preflight."}, 403)
+
     def do_GET(self):
-        if not self._is_safe_local_request(is_post=False):
-            self._send_json({"success": False, "message": "Forbidden Host header (DNS Rebinding Protection)."}, 403)
+        ok, reason = self._check_local_request(is_post=False)
+        if not ok:
+            self._send_json({"success": False, "message": reason}, 403)
             return
 
         parsed = urlparse(self.path)
@@ -1201,7 +1295,12 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         query = {k: v[0] for k, v in qs.items() if v}
 
         if path == "/" or path == "/index.html":
-            page = HTML_DASHBOARD.replace("__DEFAULT_DIR__", DEFAULT_DOWNLOAD_DIR.replace("\\", "/"))
+            page = (
+                HTML_DASHBOARD
+                .replace("__DEFAULT_DIR__", DEFAULT_DOWNLOAD_DIR.replace("\\", "/"))
+                .replace("__EXTENSION_TOKEN__", EXTENSION_TOKEN)
+                .replace("__VERSION__", __version__)
+            )
             raw = page.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1210,6 +1309,15 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             self.send_header("X-Frame-Options", "DENY")
             self.end_headers()
             self.wfile.write(raw)
+            return
+
+        if path == "/api/health":
+            self._send_json({
+                "success": True,
+                "status": "ok",
+                "version": __version__,
+                "default_dir": DEFAULT_DOWNLOAD_DIR,
+            })
             return
 
         if path == "/assets/icon.svg":
@@ -1407,7 +1515,8 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
-        if not self._is_safe_local_request(is_post=True):
+        ok, reason = self._check_local_request(is_post=True)
+        if not ok:
             # Drain small unread POST body to prevent Windows TCP RST (WinError 10054) on early 403 close
             try:
                 cl = int(self.headers.get("Content-Length", "0"))
@@ -1415,7 +1524,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     self.rfile.read(cl)
             except Exception:
                 pass
-            self._send_json({"success": False, "message": "Forbidden Origin/Host header (CSRF & DNS Rebinding Protection)."}, 403)
+            self._send_json({"success": False, "message": reason}, 403)
             return
 
         parsed = urlparse(self.path)
@@ -1483,8 +1592,11 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             concurrency = max(1, min(8, int(body.get("concurrency", 1))))
             min_delay = max(0.2, float(body.get("min_delay", 0.6)))
             max_delay = max(min_delay + 0.2, float(body.get("max_delay", 1.5)))
+            page_referer = (body.get("page_referer") or "").strip() or None
 
             try:
+                if page_referer:
+                    page_referer = validate_url(page_referer)
                 target_dir = validate_output_directory(req_dir)
                 os.makedirs(target_dir, exist_ok=True)
             except SecurityValidationError as sve:
@@ -1529,6 +1641,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     proxies,
                     proxy_rotation_mode,
                     fallback_to_direct,
+                    page_referer,
                 ),
                 daemon=True
             )
@@ -1583,6 +1696,7 @@ def main():
     sys.stderr.write(f"\n=============================================================\n")
     sys.stderr.write(f"  AegisFetch Web UI Console v{__version__} is running!\n")
     sys.stderr.write(f"  URL: {url}\n")
+    sys.stderr.write(f"  Extension Token Auth: ACTIVE (Copy via Web UI header button)\n")
     sys.stderr.write(f"  Press Ctrl+C to stop.\n")
     sys.stderr.write(f"=============================================================\n\n")
 

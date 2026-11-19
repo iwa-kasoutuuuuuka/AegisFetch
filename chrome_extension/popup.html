@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AegisFetch Companion</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <img src="icons/icon48.png" alt="AegisFetch" />
+      <span class="brand-name">AegisFetch Companion</span>
+    </div>
+    <div class="header-actions">
+      <span id="statusBadge" class="status-pill">確認中...</span>
+      <button id="btnToggleSettings" class="icon-btn" title="接続設定">⚙️</button>
+    </div>
+  </header>
+
+  <section id="settingsPanel" class="panel hidden">
+    <label class="field-label" for="inputServerUrl">サーバーURL (127.0.0.1 / localhost 限定)</label>
+    <input type="text" id="inputServerUrl" value="http://127.0.0.1:8765" />
+
+    <label class="field-label" for="inputToken">拡張機能トークン (X-Aegis-Token)</label>
+    <div class="input-row">
+      <input type="password" id="inputToken" placeholder="Web UI 右上の [🔑 拡張トークン] を貼付" />
+      <button id="btnToggleTokenVis" class="btn btn-secondary btn-sm" type="button">👁</button>
+    </div>
+
+    <label class="field-label" for="inputOutputDir">保存先フォルダ (任意)</label>
+    <input type="text" id="inputOutputDir" placeholder="空欄 = サーバー標準フォルダ" />
+
+    <div style="margin-top: 10px;">
+      <button id="btnSaveSettings" class="btn btn-primary" type="button">💾 設定を保存</button>
+    </div>
+    <div id="settingsNotice" class="notice-msg hidden"></div>
+  </section>
+
+  <nav class="tabs">
+    <button id="tabScan" class="tab-btn active" type="button">📄 ページPDF抽出</button>
+    <button id="tabQuick" class="tab-btn" type="button">✏️ 型番・URL送信</button>
+  </nav>
+
+  <section id="paneScan" class="panel">
+    <button id="btnScanPage" class="btn btn-secondary" type="button">🔍 このページのPDFをスキャン</button>
+
+    <div class="bulk-row">
+      <div class="bulk-actions">
+        <button id="btnSelectAll" class="btn btn-secondary btn-sm" type="button">全選択</button>
+        <button id="btnDeselectAll" class="btn btn-secondary btn-sm" type="button">全解除</button>
+      </div>
+      <span id="scanCount" class="scan-count">0 件検出</span>
+    </div>
+
+    <div id="pdfListContainer" class="pdf-list">
+      <div class="pdf-empty">「スキャン」を押すと表示中ページ内のPDFリンクを検出します。</div>
+    </div>
+
+    <button id="btnSendSelected" class="btn btn-primary" type="button" disabled>🚀 選択したPDFをダウンロード</button>
+  </section>
+
+  <section id="paneQuick" class="panel hidden">
+    <label class="field-label" for="quickItemsInput">型番（例: BES0002）または URL を1行ずつ入力:</label>
+    <textarea id="quickItemsInput" placeholder="BES0002&#10;BES0003&#10;https://example.com/datasheet.pdf"></textarea>
+    <div style="margin-top: 10px;">
+      <button id="btnSendQuick" class="btn btn-primary" type="button">🚀 AegisFetch へ送信</button>
+    </div>
+  </section>
+
+  <footer id="jobFooter" class="footer">
+    <div class="footer-top">
+      <span id="jobStatusText" class="job-status">待機中 (AegisFetch Web UI と連携)</span>
+      <button id="btnOpenWebUi" class="btn btn-secondary btn-sm" type="button">🖥️ Web UI を開く</button>
+    </div>
+    <div class="progress-bg">
+      <div id="jobProgressBar" class="progress-fill"></div>
+    </div>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
