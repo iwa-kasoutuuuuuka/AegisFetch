@@ -51,6 +51,21 @@ DEFAULT_DOWNLOAD_DIR = os.path.abspath(os.environ.get("AEGISFETCH_DOWNLOAD_DIR",
 
 _UI_JOBS_LOCK = threading.Lock()
 _UI_JOBS: Dict[str, Dict[str, Any]] = {}
+MAX_RETAINED_UI_JOBS = 50
+MAX_EXPORT_ARCHIVE_BYTES = 250 * 1024 * 1024  # 250MB cap for ZIP/Merged PDF export
+
+
+def _prune_old_ui_jobs():
+    """Evict oldest completed UI jobs when registry exceeds MAX_RETAINED_UI_JOBS."""
+    if len(_UI_JOBS) <= MAX_RETAINED_UI_JOBS:
+        return
+    completed_ids = [
+        jid for jid, info in _UI_JOBS.items()
+        if info.get("status") != "running"
+    ]
+    excess = len(_UI_JOBS) - MAX_RETAINED_UI_JOBS
+    for jid in completed_ids[:excess]:
+        del _UI_JOBS[jid]
 
 
 MAX_BOM_SCAN_ROWS = 5000
@@ -181,12 +196,13 @@ def _run_ui_download_job(
                     resolved_url = safe_u
                     source_tag = "direct_url"
                 else:
+                    fetcher._ensure_thread_session(rotate_proxy=(fetcher.proxy_rotator.total_count > 0))
                     resolved = CatalogExtractor.resolve_any_part(
                         item,
                         locale=locale,
                         auto_fallback_locales=auto_fallback_locales,
                         enable_generic_search=enable_generic_search,
-                        session=None
+                        session=fetcher.session
                     )
                     resolved_url = resolved["url"]
                     source_tag = resolved.get("resolved_locale") or resolved.get("source", "resolved")
@@ -643,7 +659,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <div class="card card-full">
     <div class="card-header">
       <h2>📁 ダウンロード済みカタログ一覧 (<span id="fileCountLabel">0</span> ファイル)</h2>
-      <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshFileList()">🔄 一覧を更新</button>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn-secondary" id="btnExportCsv" style="padding:6px 12px; font-size:0.8rem;" onclick="exportResultsCsv()" disabled>📊 結果CSV出力</button>
+        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="downloadAllZip()">📦 ZIP一括ダウンロード</button>
+        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="mergeAllPdfs()">📑 全PDFを1冊に結合</button>
+        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshFileList()">🔄 一覧を更新</button>
+      </div>
     </div>
     <div style="max-height: 320px; overflow-y: auto;">
       <table class="file-table">
@@ -665,6 +686,47 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   let activeJobId = null;
   let pollTimer = null;
   let lastFailedItems = [];
+  let lastJobResults = [];
+
+  const SETTINGS_KEYS = [
+    'outputDir', 'proxiesInput', 'proxyModeSelect', 'concurrencySelect',
+    'localeSelect', 'minDelay', 'maxDelay', 'fallbackDirectCheck',
+    'autoLocaleFallbackCheck', 'genericSearchCheck', 'checkUpdatesCheck'
+  ];
+
+  function saveUiSettings() {
+    try {
+      const data = {};
+      for (const id of SETTINGS_KEYS) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        data[id] = (el.type === 'checkbox') ? el.checked : el.value;
+      }
+      localStorage.setItem('aegisfetch_ui_settings_v1', JSON.stringify(data));
+    } catch (e) {}
+  }
+
+  function restoreUiSettings() {
+    try {
+      const raw = localStorage.getItem('aegisfetch_ui_settings_v1');
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      for (const id of SETTINGS_KEYS) {
+        const el = document.getElementById(id);
+        if (!el || !(id in data)) continue;
+        if (el.type === 'checkbox') el.checked = Boolean(data[id]);
+        else if (data[id] !== undefined && data[id] !== null) el.value = data[id];
+      }
+    } catch (e) {}
+  }
+
+  for (const id of SETTINGS_KEYS) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', saveUiSettings);
+    if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+      el.addEventListener('input', saveUiSettings);
+    }
+  }
 
   function updateItemCount() {
     const raw = document.getElementById('itemsInput').value;
@@ -907,6 +969,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
 
       const results = job.results || [];
+      lastJobResults = results;
       renderLogs(results);
 
       if (job.status === 'running') {
@@ -915,6 +978,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('currentItemText').textContent = `完了 (${job.status})`;
         document.getElementById('btnStart').disabled = false;
         document.getElementById('btnCancel').disabled = true;
+        document.getElementById('btnExportCsv').disabled = (results.length === 0);
         lastFailedItems = results.filter(r => !r.success).map(r => r.input);
         document.getElementById('btnRetryFailed').disabled = (lastFailedItems.length === 0);
         clearInterval(pollTimer);
@@ -1016,6 +1080,39 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
   }
 
+  function exportResultsCsv() {
+    if (!lastJobResults || lastJobResults.length === 0) return;
+    const headers = ['No', 'Input', 'Filename', 'Status', 'SizeKB', 'Source', 'ProxyUsed', 'URL', 'Error', 'Time'];
+    const esc = (v) => '"' + String(v === null || v === undefined ? '' : v).replace(/"/g, '""') + '"';
+    const rows = [headers.join(',')];
+    for (const r of lastJobResults) {
+      const st = r.skipped ? 'SKIPPED' : (r.updated ? 'UPDATED' : (r.success ? 'OK' : 'FAILED'));
+      rows.push([
+        esc(r.index), esc(r.input), esc(r.filename), esc(st),
+        esc(r.size_kb), esc(r.source), esc(r.proxy_used), esc(r.url), esc(r.error), esc(r.timestamp)
+      ].join(','));
+    }
+    const blob = new Blob(['\\uFEFF' + rows.join('\\r\\n')], {type: 'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'aegisfetch_report.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadAllZip() {
+    const outDir = document.getElementById('outputDir').value.trim();
+    window.open('/api/download-zip?dir=' + encodeURIComponent(outDir), '_blank');
+  }
+
+  function mergeAllPdfs() {
+    const outDir = document.getElementById('outputDir').value.trim();
+    window.open('/api/merge-pdf?dir=' + encodeURIComponent(outDir), '_blank');
+  }
+
   async function openOutputFolder() {
     const outDir = document.getElementById('outputDir').value.trim();
     await fetch('/api/open-folder', {
@@ -1026,6 +1123,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   }
 
   window.addEventListener('DOMContentLoaded', () => {
+    restoreUiSettings();
     refreshFileList();
     updateProxyCountBadge();
     updateItemCount();
@@ -1159,6 +1257,97 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "message": str(sve)}, 403)
             return
 
+        if path == "/api/download-zip":
+            req_dir = unquote(query.get("dir", "")) or DEFAULT_DOWNLOAD_DIR
+            try:
+                safe_dir = validate_output_directory(req_dir)
+                if not os.path.exists(safe_dir):
+                    self._send_json({"success": False, "message": "Directory does not exist."}, 404)
+                    return
+
+                pdf_files = [
+                    f for f in sorted(os.listdir(safe_dir))
+                    if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(safe_dir, f))
+                ]
+                if not pdf_files:
+                    self._send_json({"success": False, "message": "No PDF files found to archive."}, 404)
+                    return
+
+                buf = io.BytesIO()
+                total_size = 0
+                with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for fname in pdf_files:
+                        fpath = os.path.join(safe_dir, fname)
+                        total_size += os.path.getsize(fpath)
+                        if total_size > MAX_EXPORT_ARCHIVE_BYTES:
+                            self._send_json({"success": False, "message": "Total size exceeds 250MB export limit."}, 400)
+                            return
+                        zf.write(fpath, arcname=fname)
+
+                zip_bytes = buf.getvalue()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="aegisfetch_catalogs.zip"')
+                self.send_header("Content-Length", str(len(zip_bytes)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(zip_bytes)
+            except SecurityValidationError as sve:
+                self._send_json({"success": False, "message": str(sve)}, 403)
+            return
+
+        if path == "/api/merge-pdf":
+            req_dir = unquote(query.get("dir", "")) or DEFAULT_DOWNLOAD_DIR
+            try:
+                safe_dir = validate_output_directory(req_dir)
+                if not os.path.exists(safe_dir):
+                    self._send_json({"success": False, "message": "Directory does not exist."}, 404)
+                    return
+
+                pdf_files = [
+                    f for f in sorted(os.listdir(safe_dir))
+                    if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(safe_dir, f))
+                ]
+                if not pdf_files:
+                    self._send_json({"success": False, "message": "No PDF files found to merge."}, 404)
+                    return
+
+                from pypdf import PdfWriter
+                writer = PdfWriter()
+                total_size = 0
+                merged_count = 0
+                for fname in pdf_files:
+                    fpath = os.path.join(safe_dir, fname)
+                    total_size += os.path.getsize(fpath)
+                    if total_size > MAX_EXPORT_ARCHIVE_BYTES:
+                        self._send_json({"success": False, "message": "Total size exceeds 250MB merge limit."}, 400)
+                        return
+                    try:
+                        writer.append(fpath)
+                        merged_count += 1
+                    except Exception:
+                        continue
+
+                if merged_count == 0:
+                    self._send_json({"success": False, "message": "No valid PDF files could be merged."}, 400)
+                    return
+
+                out_buf = io.BytesIO()
+                writer.write(out_buf)
+                writer.close()
+                merged_bytes = out_buf.getvalue()
+
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Disposition", 'attachment; filename="merged_catalogs.pdf"')
+                self.send_header("Content-Length", str(len(merged_bytes)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(merged_bytes)
+            except SecurityValidationError as sve:
+                self._send_json({"success": False, "message": str(sve)}, 403)
+            return
+
         if path.startswith("/files/"):
             raw_fname = unquote(path[len("/files/"):])
             req_dir = unquote(query.get("dir", "")) or DEFAULT_DOWNLOAD_DIR
@@ -1268,6 +1457,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
 
             job_id = f"ui_{uuid.uuid4().hex[:8]}"
             with _UI_JOBS_LOCK:
+                _prune_old_ui_jobs()
                 _UI_JOBS[job_id] = {
                     "job_id": job_id,
                     "status": "running",

@@ -17,8 +17,13 @@ import sys
 import time
 import json
 import asyncio
+import tempfile
 
-sys.path.insert(0, os.path.abspath("e:/temp/AegisFetch"))
+OFFLINE_MODE = "--offline" in sys.argv
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TMP_ROOT = tempfile.gettempdir()
+
+sys.path.insert(0, BASE_DIR)
 
 from mcp_server import (
     server,
@@ -128,7 +133,7 @@ def test_system_dir_and_path_traversal():
             blocked = True
         record_test(f"Forbidden Output Dir Blocked: {desc}", blocked)
 
-    base_dir = "e:/temp/test_downloads_v2"
+    base_dir = os.path.join(TMP_ROOT, "test_downloads_v2")
     os.makedirs(base_dir, exist_ok=True)
     for fname in ["../../secret.txt", "C:\\Windows\\cmd.exe", "sub/../../../etc/shadow"]:
         safe_path = secure_output_path(base_dir, fname)
@@ -139,7 +144,7 @@ def test_system_dir_and_path_traversal():
     if os.path.exists(base_dir):
         try:
             os.rmdir(base_dir)
-        except:
+        except Exception:
             pass
 
 
@@ -152,6 +157,10 @@ def test_extractor_and_background_jobs():
     code2, fname2 = CatalogExtractor.parse_balluff_code("BES0002 (BES G06EB-NOC40F-S49G)")
     record_test("Extractor handles whitespace before parenthesis", fname2 == "BES0002_BES_G06EB-NOC40F-S49G.pdf")
 
+    if OFFLINE_MODE:
+        print("  [SKIP] Live network extractor & background job download tests skipped in --offline mode")
+        return
+
     # 2. Test live PDF link extraction from product page
     links_raw = extract_pdf_links("https://www.balluff.com/ja-jp/products/BES0002", use_playwright_fallback=False)
     links_data = json.loads(links_raw)
@@ -162,7 +171,7 @@ def test_extractor_and_background_jobs():
     )
 
     # 3. Test Non-Blocking Background Job Queue
-    bg_dir = "e:/temp/test_bg_job"
+    bg_dir = os.path.join(TMP_ROOT, "test_bg_job")
     job_raw = start_batch_job(
         items=["BES0002"],
         is_part_numbers=True,
@@ -239,7 +248,7 @@ def test_stdio_jsonrpc_integrity():
 
     # Verify real subprocess stdio JSON-RPC initialize handshake
     proc = subprocess.Popen(
-        [sys.executable, os.path.abspath("e:/temp/AegisFetch/mcp_server.py")],
+        [sys.executable, os.path.join(BASE_DIR, "mcp_server.py")],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -282,7 +291,7 @@ def test_web_ui_endpoints():
     t = threading.Thread(target=ui_server.serve_forever, daemon=True)
     t.start()
     base_url = "http://127.0.0.1:18765"
-    test_dir = "e:/temp/test_webui_dl"
+    test_dir = os.path.join(TMP_ROOT, "test_webui_dl")
 
     try:
         # 1. Dashboard HTML
@@ -308,40 +317,63 @@ def test_web_ui_endpoints():
             blocked_403 = (e.code == 403)
         record_test("Web UI POST /api/start blocks System32 with HTTP 403", blocked_403)
 
-        # 4. Launch real download job from Web UI
-        req_dl = urllib.request.Request(
-            base_url + "/api/start",
-            data=json.dumps({"items": ["BES0002"], "output_dir": test_dir, "min_delay": 0.3, "max_delay": 0.5}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req_dl) as r:
-            start_data = json.loads(r.read().decode("utf-8"))
-            job_id = start_data.get("job_id")
-            record_test("Web UI POST /api/start launches download job", start_data.get("success") is True and bool(job_id))
+        if not OFFLINE_MODE:
+            # 4. Launch real download job from Web UI
+            req_dl = urllib.request.Request(
+                base_url + "/api/start",
+                data=json.dumps({"items": ["BES0002"], "output_dir": test_dir, "min_delay": 0.3, "max_delay": 0.5}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req_dl) as r:
+                start_data = json.loads(r.read().decode("utf-8"))
+                job_id = start_data.get("job_id")
+                record_test("Web UI POST /api/start launches download job", start_data.get("success") is True and bool(job_id))
 
-        job_state = {}
-        for _ in range(25):
-            with urllib.request.urlopen(f"{base_url}/api/job?job_id={job_id}") as r:
-                job_state = json.loads(r.read().decode("utf-8"))
-                if job_state.get("status") == "completed":
-                    break
-            time.sleep(0.5)
+            job_state = {}
+            for _ in range(25):
+                with urllib.request.urlopen(f"{base_url}/api/job?job_id={job_id}") as r:
+                    job_state = json.loads(r.read().decode("utf-8"))
+                    if job_state.get("status") == "completed":
+                        break
+                time.sleep(0.5)
 
-        record_test(
-            "Web UI GET /api/job completes download",
-            job_state.get("status") == "completed" and job_state.get("success_count") == 1,
-        )
+            record_test(
+                "Web UI GET /api/job completes download",
+                job_state.get("status") == "completed" and job_state.get("success_count") == 1,
+            )
 
-        # 5. List and serve downloaded PDF via Web UI
-        with urllib.request.urlopen(f"{base_url}/api/files?dir={test_dir}") as r:
-            fdata = json.loads(r.read().decode("utf-8"))
-            files = fdata.get("files", [])
-            record_test("Web UI GET /api/files lists downloaded PDF", len(files) == 1)
-            fname = files[0]["name"]
+            # 5. List and serve downloaded PDF via Web UI
+            with urllib.request.urlopen(f"{base_url}/api/files?dir={urllib.parse.quote(test_dir)}") as r:
+                fdata = json.loads(r.read().decode("utf-8"))
+                files = fdata.get("files", [])
+                record_test("Web UI GET /api/files lists downloaded PDF", len(files) == 1)
+                fname = files[0]["name"]
 
-        with urllib.request.urlopen(f"{base_url}/files/{fname}?dir={test_dir}") as r:
-            pdf_bytes = r.read()
-            record_test("Web UI GET /files/<name> streams valid PDF", pdf_bytes.startswith(b"%PDF"))
+            with urllib.request.urlopen(f"{base_url}/files/{fname}?dir={urllib.parse.quote(test_dir)}") as r:
+                pdf_bytes = r.read()
+                record_test("Web UI GET /files/<name> streams valid PDF", pdf_bytes.startswith(b"%PDF"))
+
+            # 5b. Test ZIP bulk export & PDF Merge endpoints
+            with urllib.request.urlopen(f"{base_url}/api/download-zip?dir={urllib.parse.quote(test_dir)}") as r:
+                zip_bytes = r.read()
+                record_test("Web UI GET /api/download-zip returns valid ZIP", r.status == 200 and zip_bytes.startswith(b"PK"))
+
+            with urllib.request.urlopen(f"{base_url}/api/merge-pdf?dir={urllib.parse.quote(test_dir)}") as r:
+                merged_bytes = r.read()
+                record_test("Web UI GET /api/merge-pdf returns merged PDF", r.status == 200 and merged_bytes.startswith(b"%PDF"))
+        else:
+            # Offline ZIP & PDF Merge verification using synthetic valid PDFs via pypdf
+            from pypdf import PdfWriter
+            os.makedirs(test_dir, exist_ok=True)
+            for idx in (1, 2):
+                w = PdfWriter()
+                w.add_blank_page(width=200, height=200)
+                with open(os.path.join(test_dir, f"sample_{idx}.pdf"), "wb") as fp:
+                    w.write(fp)
+            with urllib.request.urlopen(f"{base_url}/api/download-zip?dir={urllib.parse.quote(test_dir)}") as r:
+                record_test("Web UI GET /api/download-zip returns valid ZIP (offline)", r.status == 200 and r.read().startswith(b"PK"))
+            with urllib.request.urlopen(f"{base_url}/api/merge-pdf?dir={urllib.parse.quote(test_dir)}") as r:
+                record_test("Web UI GET /api/merge-pdf returns merged PDF (offline)", r.status == 200 and r.read().startswith(b"%PDF"))
 
         # 6. Test ProxyRotator & Web UI POST /api/free-proxies
         from proxy_manager import ProxyRotator
@@ -440,44 +472,43 @@ def test_v22_advanced_features():
     record_test("is_likely_balluff_code rejects AM6-CN-3H", CatalogExtractor.is_likely_balluff_code("AM6-CN-3H") is False)
 
     # 4. Test Parallel Multi-threaded Download & Revision Tracking (Feature 7 & 9)
-    par_dir = "e:/temp/test_v22_parallel"
-    try:
-        fetcher = AegisFetch(output_dir=par_dir, min_delay=0.2, max_delay=0.4, check_updates=True, quiet=True)
-        targets = [
-            {"url": "https://publications.balluff.com/pdfengine/pdf?type=pdb&id=153791&con=ja", "filename": "BES0002.pdf"},
-            {"url": "https://publications.balluff.com/pdfengine/pdf?type=pdb&id=153792&con=ja", "filename": "BES0003.pdf"},
-        ]
-        res_par = fetcher.download_batch(targets, concurrency=2)
+    if not OFFLINE_MODE:
+        par_dir = os.path.join(TMP_ROOT, "test_v22_parallel")
+        try:
+            fetcher = AegisFetch(output_dir=par_dir, min_delay=0.2, max_delay=0.4, check_updates=True, quiet=True)
+            targets = [
+                {"url": "https://publications.balluff.com/pdfengine/pdf?type=pdb&id=153791&con=ja", "filename": "BES0002.pdf"},
+                {"url": "https://publications.balluff.com/pdfengine/pdf?type=pdb&id=153792&con=ja", "filename": "BES0003.pdf"},
+            ]
+            res_par = fetcher.download_batch(targets, concurrency=2)
+            record_test(
+                "Parallel download (concurrency=2) completes both files",
+                len(res_par) == 2 and all(r.success for r in res_par)
+            )
+
+            meta_file = os.path.join(par_dir, ".aegisfetch_meta.json")
+            record_test("Revision metadata (.aegisfetch_meta.json) persisted", os.path.exists(meta_file))
+
+            res_rev = fetcher.download_file(targets[0]["url"], filename="BES0002.pdf", check_updates=True)
+            record_test(
+                "Revision check (check_updates=True) marks unchanged file as UP-TO-DATE",
+                res_rev.skipped is True and res_rev.proxy_used == "UP-TO-DATE"
+            )
+        finally:
+            shutil.rmtree(par_dir, ignore_errors=True)
+
+        # 5. Test Generic Cross-Manufacturer Datasheet Search (Feature 8)
+        hits = CatalogExtractor.search_generic_datasheet("LM358", max_results=3)
         record_test(
-            "Parallel download (concurrency=2) completes both files",
-            len(res_par) == 2 and all(r.success for r in res_par)
+            "Generic datasheet search finds valid public PDF links for non-BALLUFF part (LM358)",
+            isinstance(hits, list) and len(hits) >= 0
         )
-
-        # Verify metadata file was created for revision check
-        meta_file = os.path.join(par_dir, ".aegisfetch_meta.json")
-        record_test("Revision metadata (.aegisfetch_meta.json) persisted", os.path.exists(meta_file))
-
-        # Re-run with check_updates=True -> should detect unchanged & skip as UP-TO-DATE
-        res_rev = fetcher.download_file(targets[0]["url"], filename="BES0002.pdf", check_updates=True)
-        record_test(
-            "Revision check (check_updates=True) marks unchanged file as UP-TO-DATE",
-            res_rev.skipped is True and res_rev.proxy_used == "UP-TO-DATE"
-        )
-    finally:
-        shutil.rmtree(par_dir, ignore_errors=True)
-
-    # 5. Test Generic Cross-Manufacturer Datasheet Search (Feature 8)
-    hits = CatalogExtractor.search_generic_datasheet("LM358", max_results=3)
-    record_test(
-        "Generic datasheet search finds valid public PDF links for non-BALLUFF part (LM358)",
-        isinstance(hits, list) and len(hits) >= 0
-    )
 
     # 6. Test XLSX ZIP Decompression Bomb Defense (v2.2.1 Security)
     import zipfile
     bomb_buf = io.BytesIO()
     with zipfile.ZipFile(bomb_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("xl/worksheets/sheet1.xml", b"A" * (22 * 1024 * 1024))  # 22MB zeros compresses to ~25KB
+        zf.writestr("xl/worksheets/sheet1.xml", b"A" * (22 * 1024 * 1024))
     bomb_blocked = False
     try:
         _parse_uploaded_bom_file("bomb.xlsx", bomb_buf.getvalue())
@@ -486,10 +517,9 @@ def test_v22_advanced_features():
     record_test("XLSX ZIP Bomb Defense blocks >20MB uncompressed archive", bomb_blocked)
 
     # 7. Test SSRF-safe HEAD request in Revision Check (v2.2.1 Security)
-    head_ssrf_dir = "e:/temp/test_head_ssrf"
+    head_ssrf_dir = os.path.join(TMP_ROOT, "test_head_ssrf")
     try:
         f_head = AegisFetch(output_dir=head_ssrf_dir, check_updates=True, quiet=True)
-        # Seed dummy file and meta so HEAD check triggers
         dummy_pdf = os.path.join(head_ssrf_dir, "test.pdf")
         with open(dummy_pdf, "wb") as fp:
             fp.write(b"%PDF-1.4\n" + b"0" * 600)
@@ -501,6 +531,20 @@ def test_v22_advanced_features():
         )
     finally:
         shutil.rmtree(head_ssrf_dir, ignore_errors=True)
+
+    # 8. Test Memory Leak Prevention (Job Registry Pruning v2.3.0)
+    from web_ui import _UI_JOBS, _UI_JOBS_LOCK, _prune_old_ui_jobs, MAX_RETAINED_UI_JOBS
+    with _UI_JOBS_LOCK:
+        _UI_JOBS.clear()
+        for i in range(MAX_RETAINED_UI_JOBS + 10):
+            _UI_JOBS[f"old_{i}"] = {"status": "completed"}
+        _prune_old_ui_jobs()
+        pruned_count = len(_UI_JOBS)
+        _UI_JOBS.clear()
+    record_test(
+        f"Web UI job registry prunes completed jobs to <= {MAX_RETAINED_UI_JOBS}",
+        pruned_count == MAX_RETAINED_UI_JOBS
+    )
 
 
 if __name__ == "__main__":

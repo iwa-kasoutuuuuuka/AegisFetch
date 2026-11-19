@@ -46,6 +46,20 @@ DEFAULT_BASE_DIR = os.path.abspath(os.environ.get("AEGISFETCH_DOWNLOAD_DIR", "./
 # In-memory background job registry for non-blocking large batch downloads
 _JOBS_LOCK = threading.Lock()
 _BACKGROUND_JOBS: Dict[str, Dict[str, Any]] = {}
+MAX_RETAINED_JOBS = 50
+
+
+def _prune_old_jobs():
+    """Evict oldest completed jobs when registry exceeds MAX_RETAINED_JOBS."""
+    if len(_BACKGROUND_JOBS) <= MAX_RETAINED_JOBS:
+        return
+    completed_ids = [
+        jid for jid, info in _BACKGROUND_JOBS.items()
+        if info.get("status") != "running"
+    ]
+    excess = len(_BACKGROUND_JOBS) - MAX_RETAINED_JOBS
+    for jid in completed_ids[:excess]:
+        del _BACKGROUND_JOBS[jid]
 
 
 @server.tool(
@@ -323,11 +337,12 @@ def _run_background_job(
         def _do_one(item: str) -> Dict[str, Any]:
             try:
                 if is_part_numbers and not item.lower().startswith("http"):
+                    fetcher._ensure_thread_session(rotate_proxy=(fetcher.proxy_rotator.total_count > 0))
                     resolved = CatalogExtractor.resolve_any_part(
                         item,
                         auto_fallback_locales=True,
                         enable_generic_search=enable_generic_search,
-                        session=None
+                        session=fetcher.session
                     )
                     res = fetcher.download_file(
                         url=resolved["url"],
@@ -429,6 +444,7 @@ def start_batch_job(
 
     job_id = f"job_{uuid.uuid4().hex[:8]}"
     with _JOBS_LOCK:
+        _prune_old_jobs()
         _BACKGROUND_JOBS[job_id] = {
             "job_id": job_id,
             "status": "running",

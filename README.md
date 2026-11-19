@@ -158,14 +158,16 @@ Antigravity や Claude Code から直接ツール呼び出しでダウンロー�
 
 ---
 
-## Advanced Productivity Features (v2.2.0) / 実務支援機能
+## Advanced Productivity Features (v2.3.0) / 実務支援機能
 
+- **ZIP Bulk Export & PDF Merger**: Download all fetched catalogs as a single `.zip` archive or merge them into one unified `merged_catalogs.pdf` directly from the Web UI.
+- **CSV Report Export & Auto-Saved Settings**: Export full download results as BOM UTF-8 CSV and automatically persist your UI settings/proxy lists in `localStorage`.
 - **Excel (.xlsx) / CSV / TXT Drag & Drop BOM Import**: Drop any BOM file directly onto the Web UI input area to extract part numbers and URLs automatically.
 - **One-Click Retry Failed**: Re-queue only failed items after a batch run with a single click.
 - **Multi-Locale Auto-Fallback (`ja-jp` ➔ `en-us` ➔ `de-de`)**: Automatically retrieves English or German datasheets if a Japanese version does not exist.
-- **Multi-Threaded Parallel Downloads (`concurrency=1..8`)**: Thread-local `curl_cffi` sessions combined with proxy rotation dramatically accelerate bulk downloads.
+- **Multi-Threaded Parallel Downloads (`concurrency=1..8`)**: Thread-local `curl_cffi` sessions combined with proxy rotation dramatically accelerate bulk downloads across both part resolution and file fetching.
 - **Cross-Manufacturer Generic Datasheet Search**: Automatically searches public PDF datasheets for non-BALLUFF part numbers.
-- **Catalog Revision / Update Check (`--check-updates`)**: Tracks `ETag`, `Last-Modified`, and `SHA-256` in `.aegisfetch_meta.json` and only re-downloads when a catalog is revised.
+- **Catalog Revision / Update Check (`--check-updates`)**: Tracks `ETag`, `Last-Modified`, and `SHA-256` in `.aegisfetch_meta.json` with automatic `GET Range: bytes=0-0` fallback when `HEAD` is blocked.
 
 ---
 
@@ -178,9 +180,9 @@ AegisFetch v2.2 supports switching proxy IP on **every single file download** (R
 
 ---
 
-## Security & Verification / セキュリティと脆弱性対策 (61/61 Tests Passing)
+## Security & Verification / セキュリティと脆弱性対策 (64/64 Tests Passing)
 
-AegisFetch v2.2.1 is built with deep-defense security guardrails audited across 61 automated tests:
+AegisFetch v2.3.0 is built with deep-defense security guardrails audited across 64 automated tests (including GitHub Actions CI across Ubuntu & Windows):
 - **Direct, Open-Redirect (GET & HEAD) & Proxy-based SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) for both GET and revision-check HEAD requests as well as proxy targets, blocking private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
 - **XLSX ZIP Decompression Bomb Defense**: Pre-inspects uncompressed ZIP entry sizes in uploaded `.xlsx` BOM files (20MB cap, 5,000-row scan limit) before parsing.
 - **Web UI CSRF & DNS Rebinding Protection**: Strictly validates `Host` and `Origin` headers on local Web UI API endpoints (`127.0.0.1` / `localhost` only) and enforces `X-Frame-Options: DENY` & `X-Content-Type-Options: nosniff`.
@@ -214,6 +216,12 @@ python test_mcp_security.py
 
 ## Changelog / 更新履歴
 
+- **v2.3.0**:
+  - Added Web UI ZIP bulk download (`/api/download-zip`), PDF merger (`/api/merge-pdf` via `pypdf`), BOM UTF-8 CSV report export, and `localStorage` auto-saved UI settings.
+  - Shared thread-local proxy-rotated sessions with `CatalogExtractor` part resolution to eliminate redundant TLS handshakes and prevent Cloudflare blocks on product pages.
+  - Added automatic `GET Range: bytes=0-0` fallback in revision checking for servers blocking `HEAD` requests.
+  - Added automatic job history pruning (50-job cap) in both Web UI and MCP server registries to prevent memory growth during long-running sessions.
+  - Added GitHub Actions CI workflow (`.github/workflows/test.yml`) running offline security & unit tests across Ubuntu & Windows.
 - **v2.2.1**:
   - Fixed Open-Redirect SSRF vector in revision-check `HEAD` requests via shared hop-by-hop validator.
   - Added `.xlsx` ZIP decompression bomb protection (20MB uncompressed cap, 5,000-row scan limit).

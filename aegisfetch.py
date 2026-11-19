@@ -41,7 +41,7 @@ from security import (
 )
 from proxy_manager import ProxyRotator, fetch_and_test_free_proxies, mask_proxy_credentials
 
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 
 
 @dataclass
@@ -279,7 +279,8 @@ class AegisFetch:
 
     def _has_remote_revision_changed(self, url: str, final_path: str, headers: Dict[str, str]) -> bool:
         """
-        Check via SSRF-safe HTTP HEAD whether the remote catalog has been revised compared to local metadata.
+        Check via SSRF-safe HTTP HEAD (with automatic GET Range: bytes=0-0 fallback for
+        servers returning 403/405/501 on HEAD) whether the remote catalog has been revised.
         Returns True if an update/revision is detected, False if unchanged.
         """
         meta = self._load_meta()
@@ -291,14 +292,32 @@ class AegisFetch:
         try:
             self._ensure_thread_session(rotate_proxy=False)
             resp = self._request_with_safe_redirects("HEAD", url, headers=headers, stream=False, timeout=12)
-            if resp.status_code != 200:
+
+            remote_cl = ""
+            if resp.status_code in (403, 405, 501):
+                resp.close()
+                range_headers = dict(headers)
+                range_headers["Range"] = "bytes=0-0"
+                resp = self._request_with_safe_redirects("GET", url, headers=range_headers, stream=True, timeout=12)
+                if resp.status_code not in (200, 206):
+                    resp.close()
+                    return False
+                cr = (resp.headers.get("Content-Range") or resp.headers.get("content-range") or "").strip()
+                if "/" in cr:
+                    total_part = cr.split("/")[-1].strip()
+                    if total_part.isdigit():
+                        remote_cl = total_part
+                if not remote_cl and resp.status_code == 200:
+                    remote_cl = (resp.headers.get("Content-Length") or resp.headers.get("content-length") or "").strip()
+            elif resp.status_code != 200:
                 resp.close()
                 return False
+            else:
+                remote_cl = (resp.headers.get("Content-Length") or resp.headers.get("content-length") or "").strip()
 
             remote_etag = (resp.headers.get("ETag") or resp.headers.get("etag") or "").strip()
             remote_lm = (resp.headers.get("Last-Modified") or resp.headers.get("last-modified") or "").strip()
             remote_date = (resp.headers.get("Date") or resp.headers.get("date") or "").strip()
-            remote_cl = (resp.headers.get("Content-Length") or resp.headers.get("content-length") or "").strip()
             resp.close()
 
             if remote_etag and prev.get("etag") and remote_etag != prev.get("etag"):
