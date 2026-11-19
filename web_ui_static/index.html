@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AegisFetch Web UI v__VERSION__ - Resilient Catalog Downloader</title>
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <img src="/assets/icon.svg" alt="AegisFetch" />
+    <div class="brand-title">
+      <h1>AegisFetch Web Console v__VERSION__</h1>
+      <p>Anti-403 WAF-Evading Catalog Downloader, BOM Importer &amp; Multi-Proxy IP Rotator</p>
+    </div>
+  </div>
+  <div class="badge-group">
+    <span class="badge">TLS: Chrome124 / Safari</span>
+    <span class="badge badge-purple" id="headerProxyBadge">Proxy: DIRECT</span>
+    <span class="badge">SSRF &amp; CSRF Guard: ACTIVE</span>
+    <button class="btn-secondary" style="padding:4px 10px; font-size:0.74rem;" onclick="copyExtensionToken()">🔑 拡張トークンをコピー</button>
+  </div>
+</header>
+
+<div class="container">
+  <!-- Left Card -->
+  <div class="card">
+    <div class="card-header">
+      <h2>📥 カタログ一括ダウンロード設定</h2>
+      <div style="display:flex; gap:6px;">
+        <input type="file" id="bomFileInput" accept=".txt,.csv,.xlsx" style="display:none;" onchange="handleBomFileSelect(this.files[0])" />
+        <button class="btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="document.getElementById('bomFileInput').click()">📄 Excel/CSV読込</button>
+        <button class="btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="loadSampleList()">サンプル挿入</button>
+      </div>
+    </div>
+
+    <label for="itemsInput">型番リスト（BALLUFF / 他社メーカー型番）または URL を1行ずつ入力:</label>
+    <div class="drop-zone" id="dropZone">
+      <textarea id="itemsInput" placeholder="ここに型番・URLを入力、または Excel (.xlsx) / CSV / TXT ファイルをドラッグ＆ドロップ！&#10;&#10;例:&#10;BES0002(BES G06EB-NOC40F-S49G)&#10;AM6-CN-3H&#10;https://example.com/datasheet.pdf"></textarea>
+      <div class="drop-hint">
+        <span>💡 Excel (.xlsx) / CSV / TXT のドラッグ＆ドロップに対応</span>
+        <span id="itemCountLabel">0 件</span>
+      </div>
+    </div>
+
+    <div style="margin-top: 12px;">
+      <label for="extractUrlInput">🔍 WebページからPDFリンクを自動抽出して上のリストに追加:</label>
+      <div class="extractor-box">
+        <input type="text" id="extractUrlInput" placeholder="https://www.balluff.com/ja-jp/products/BES0002" />
+        <button class="btn-secondary" id="btnExtract" onclick="extractLinksFromPage()" style="white-space:nowrap;">ページ解析</button>
+      </div>
+    </div>
+
+    <!-- Proxy Rotation Box -->
+    <div class="proxy-section">
+      <div class="proxy-header">
+        <h3>🌐 プロキシ自動ローテーション (1件ごとに別IPへ切替)</h3>
+        <div style="display:flex; gap:5px;">
+          <button class="btn-purple" id="btnHarvestProxies" onclick="harvestFreeProxies(true)">⚡ 無料プロキシ取得＆テスト</button>
+          <button class="btn-secondary" style="padding:4px 8px; font-size:0.73rem;" onclick="loadPresetProxies()">📋 プリセット</button>
+          <button class="btn-secondary" style="padding:4px 8px; font-size:0.73rem;" onclick="clearProxies()">クリア</button>
+        </div>
+      </div>
+      <textarea id="proxiesInput" style="min-height: 75px; font-size:0.78rem;" placeholder="http://176.111.37.5:39811&#10;socks5://208.102.51.6:58208 (空欄なら直接通信)" oninput="updateProxyCountBadge()"></textarea>
+      <div class="form-grid" style="margin-top:6px;">
+        <div>
+          <select id="proxyModeSelect" style="padding:6px 10px; font-size:0.78rem;">
+            <option value="round_robin" selected>順番に切替 (Round-Robin)</option>
+            <option value="random">ランダム切替 (Random)</option>
+          </select>
+        </div>
+        <div style="display:flex; align-items:center;">
+          <label class="checkbox-row" style="margin:0;">
+            <input type="checkbox" id="fallbackDirectCheck" checked />
+            <span>不通時は直接通信(Direct)で救済</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-grid">
+      <div>
+        <label for="outputDir">保存先フォルダ (Output Dir):</label>
+        <input type="text" id="outputDir" value="__DEFAULT_DIR__" />
+      </div>
+      <div>
+        <label for="concurrencySelect">並列ダウンロード数 (⑦ 並列高速化):</label>
+        <select id="concurrencySelect">
+          <option value="1" selected>1 並列 (直列・最も安全)</option>
+          <option value="2">2 並列 (高速)</option>
+          <option value="3">3 並列 (プロキシ併用推奨)</option>
+          <option value="5">5 並列 (爆速・複数プロキシ向け)</option>
+        </select>
+      </div>
+      <div>
+        <label for="localeSelect">BALLUFF 優先言語:</label>
+        <select id="localeSelect">
+          <option value="ja-jp" selected>日本語 (ja-jp)</option>
+          <option value="en-us">English (en-us)</option>
+          <option value="de-de">Deutsch (de-de)</option>
+        </select>
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+        <div>
+          <label for="minDelay">最小待機(秒):</label>
+          <input type="number" id="minDelay" value="0.6" step="0.2" min="0.2" />
+        </div>
+        <div>
+          <label for="maxDelay">最大待機(秒):</label>
+          <input type="number" id="maxDelay" value="1.5" step="0.2" min="0.4" />
+        </div>
+      </div>
+    </div>
+
+    <!-- Advanced Feature Toggles -->
+    <div class="options-box">
+      <label class="checkbox-row">
+        <input type="checkbox" id="autoLocaleFallbackCheck" checked />
+        <span>⑥ 英語/独語 自動フォールバック</span>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="genericSearchCheck" checked />
+        <span>⑧ 他社型番もWeb自動検索 (PDF探索)</span>
+      </label>
+      <label class="checkbox-row" style="grid-column: 1 / -1;">
+        <input type="checkbox" id="checkUpdatesCheck" />
+        <span>⑨ カタログ改訂・更新チェック (既存ファイルの最新版をサーバー確認)</span>
+      </label>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn-primary" id="btnStart" onclick="startDownloadJob()">🚀 ダウンロード開始</button>
+      <button class="btn-amber" id="btnRetryFailed" onclick="retryFailedItems()" disabled>🔄 失敗分のみ再試行</button>
+      <button class="btn-danger" id="btnCancel" onclick="cancelCurrentJob()" disabled>⏹ 停止</button>
+      <button class="btn-secondary" onclick="openOutputFolder()">📂 フォルダを開く</button>
+    </div>
+  </div>
+
+  <!-- Right Card -->
+  <div class="card">
+    <div class="card-header">
+      <h2>📊 リアルタイム実行ステータス</h2>
+      <span id="jobStatusBadge" class="badge">待機中 (IDLE)</span>
+    </div>
+
+    <div class="job-sync-bar">
+      <label for="recentJobSelect" style="margin:0; white-space:nowrap;">ジョブ履歴 (拡張機能連携):</label>
+      <select id="recentJobSelect"></select>
+    </div>
+
+    <div class="progress-box">
+      <div style="display:flex; justify-content:space-between; font-size:0.84rem; gap:10px;">
+        <span id="currentItemText" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">ジョブ開始待機中...</span>
+        <span id="progressPercent" style="white-space:nowrap;">0% (0/0)</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressBar"></div>
+      </div>
+      <div style="font-size:0.75rem; color:#d8b4fe; margin-top:4px;" id="activeProxyText">
+        現在の通信経路: DIRECT (標準回線)
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="num" id="statTotal" style="color:var(--text-main);">0</div>
+          <div class="lbl">総件数</div>
+        </div>
+        <div class="stat-card">
+          <div class="num" id="statSuccess" style="color:var(--green);">0</div>
+          <div class="lbl">成功 / 更新</div>
+        </div>
+        <div class="stat-card">
+          <div class="num" id="statSkipped" style="color:var(--amber);">0</div>
+          <div class="lbl">スキップ (既存)</div>
+        </div>
+        <div class="stat-card">
+          <div class="num" id="statFailed" style="color:var(--red);">0</div>
+          <div class="lbl">失敗</div>
+        </div>
+      </div>
+    </div>
+
+    <label>実行ログ (1件ごとの通信経路 / 言語・検索ソース / 結果):</label>
+    <div class="log-list" id="logList">
+      <div style="color:var(--text-muted); text-align:center; padding: 30px 0;">
+        左側のフォームに型番・URLを入力、または Excel/CSV をドロップしてください。
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom Card -->
+  <div class="card card-full">
+    <div class="card-header">
+      <h2>📁 ダウンロード済みカタログ一覧 (<span id="fileCountLabel">0</span> ファイル)</h2>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn-secondary" id="btnExportCsv" style="padding:6px 12px; font-size:0.8rem;" onclick="exportResultsCsv()" disabled>📊 結果CSV出力</button>
+        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="downloadAllZip()">📦 ZIP一括ダウンロード</button>
+        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="mergeAllPdfs()">📑 全PDFを1冊に結合</button>
+        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshFileList()">🔄 一覧を更新</button>
+      </div>
+    </div>
+    <div style="max-height: 320px; overflow-y: auto;">
+      <table class="file-table">
+        <thead>
+          <tr>
+            <th>ファイル名 (クリックでブラウザ表示)</th>
+            <th>サイズ</th>
+            <th>更新日時</th>
+            <th>検証ステータス</th>
+          </tr>
+        </thead>
+        <tbody id="fileTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>window.__AEGIS_EXTENSION_TOKEN__ = __EXTENSION_TOKEN_JSON__;</script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

@@ -1,71 +1,8 @@
 "use strict";
 
-const DEFAULT_SERVER_URL = "http://127.0.0.1:8765";
+import { DEFAULT_SERVER_URL, isAllowedLocalServer, getSafePublicReferer } from "./shared.js";
+
 let badgeTimer = null;
-
-function isAllowedLocalServer(urlStr) {
-  try {
-    const parsed = new URL((urlStr || "").trim());
-    return (
-      parsed.protocol === "http:" &&
-      (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")
-    );
-  } catch (e) {
-    return false;
-  }
-}
-
-function isPrivateOrLocalHostname(hostname) {
-  const h = (hostname || "").toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
-  if (!h || h === "localhost" || h.endsWith(".localhost")) {
-    return true;
-  }
-  if (!h.includes(".") && !h.includes(":")) {
-    return true;
-  }
-  if (h.includes(":")) {
-    return (
-      h === "::1" ||
-      h === "::" ||
-      h.startsWith("fc") ||
-      h.startsWith("fd") ||
-      h.startsWith("fe80") ||
-      h.startsWith("::ffff:")
-    );
-  }
-  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (ipv4Match) {
-    const a = Number(ipv4Match[1]);
-    const b = Number(ipv4Match[2]);
-    if (a === 127 || a === 10 || a === 0) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-  }
-  return false;
-}
-
-function getSafePublicReferer(urlStr, items) {
-  if (!urlStr || !Array.isArray(items)) {
-    return undefined;
-  }
-  const hasUrlItem = items.some((it) => /^https?:\/\//i.test((it || "").trim()));
-  if (!hasUrlItem) {
-    return undefined;
-  }
-  try {
-    const parsed = new URL(urlStr.trim());
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return undefined;
-    }
-    if (isPrivateOrLocalHostname(parsed.hostname)) {
-      return undefined;
-    }
-    return parsed.href;
-  } catch (e) {
-    return undefined;
-  }
-}
 
 function flashBadge(text, color) {
   if (badgeTimer) {
@@ -95,7 +32,14 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.contextMenus.onClicked.addListener(async (info) => {
-  const stored = await chrome.storage.local.get(["serverUrl", "apiToken", "outputDir"]);
+  const stored = await chrome.storage.local.get([
+    "serverUrl",
+    "apiToken",
+    "outputDir",
+    "concurrency",
+    "locale",
+    "checkUpdates"
+  ]);
   const rawServer = stored.serverUrl || DEFAULT_SERVER_URL;
   if (!isAllowedLocalServer(rawServer)) {
     flashBadge("ERR", "#ef4444");
@@ -136,7 +80,10 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
       body: JSON.stringify({
         items,
         page_referer: pageReferer,
-        output_dir: outputDir || undefined
+        output_dir: outputDir || undefined,
+        concurrency: Number(stored.concurrency || 1),
+        locale: stored.locale || "ja-jp",
+        check_updates: Boolean(stored.checkUpdates)
       })
     });
 

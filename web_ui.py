@@ -90,11 +90,74 @@ def _load_or_create_extension_token() -> str:
 
 
 EXTENSION_TOKEN = _load_or_create_extension_token()
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_ui_static")
+
+
+def _load_static_asset(filename: str) -> bytes:
+    """Load a static Web UI asset safely from web_ui_static/."""
+    safe_name = os.path.basename(filename)
+    full_path = os.path.join(_STATIC_DIR, safe_name)
+    with open(full_path, "rb") as f:
+        return f.read()
+
+
+def _get_history_path() -> str:
+    env_path = os.environ.get("AEGISFETCH_HISTORY_FILE", "").strip()
+    if env_path:
+        return env_path
+    return os.path.join(os.path.expanduser("~"), ".aegisfetch_ui_history.json")
+
 
 _UI_JOBS_LOCK = threading.Lock()
 _UI_JOBS: Dict[str, Dict[str, Any]] = {}
 MAX_RETAINED_UI_JOBS = 50
+MAX_PERSISTED_JOBS = 20
 MAX_EXPORT_ARCHIVE_BYTES = 250 * 1024 * 1024  # 250MB cap for ZIP/Merged PDF export
+MAX_BROWSER_PDF_BYTES = 25 * 1024 * 1024  # 25MB cap for browser-authenticated PDF upload
+
+
+def _load_job_history():
+    """Load persisted UI job summaries/results from disk on startup."""
+    hist_path = _get_history_path()
+    if not os.path.exists(hist_path):
+        return
+    try:
+        with open(hist_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return
+        with _UI_JOBS_LOCK:
+            for item in data[-MAX_PERSISTED_JOBS:]:
+                if isinstance(item, dict) and isinstance(item.get("job_id"), str):
+                    if item.get("status") == "running":
+                        item["status"] = "interrupted"
+                    _UI_JOBS[item["job_id"]] = item
+    except Exception:
+        pass
+
+
+def _save_job_history():
+    """Persist recent completed/cancelled UI jobs atomically to disk."""
+    hist_path = _get_history_path()
+    try:
+        with _UI_JOBS_LOCK:
+            snapshot = []
+            for info in list(_UI_JOBS.values())[-MAX_PERSISTED_JOBS:]:
+                copy_info = dict(info)
+                copy_info["results"] = list(info.get("results", []))[-200:]
+                snapshot.append(copy_info)
+        parent = os.path.dirname(os.path.abspath(hist_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = hist_path + f".{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, hist_path)
+    except Exception:
+        pass
+
+
+_load_job_history()
 
 
 def _prune_old_ui_jobs():
@@ -348,865 +411,7 @@ def _run_ui_download_job(
                 _UI_JOBS[job_id]["status"] = "completed"
                 _UI_JOBS[job_id]["current_item"] = None
                 _UI_JOBS[job_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-HTML_DASHBOARD = """<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AegisFetch Web UI v__VERSION__ - Resilient Catalog Downloader</title>
-  <style>
-    :root {
-      --bg-dark: #0b0f19;
-      --bg-card: #131b2e;
-      --bg-input: #0e1424;
-      --border: #233252;
-      --cyan: #00f2fe;
-      --blue: #4facfe;
-      --purple: #a855f7;
-      --green: #10b981;
-      --amber: #f59e0b;
-      --red: #ef4444;
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
-      background: radial-gradient(circle at 50% 0%, #162238 0%, var(--bg-dark) 75%);
-      color: var(--text-main);
-      min-height: 100vh;
-      padding-bottom: 40px;
-    }
-    header {
-      border-bottom: 1px solid var(--border);
-      background: rgba(11, 15, 25, 0.85);
-      backdrop-filter: blur(10px);
-      position: sticky;
-      top: 0;
-      z-index: 100;
-      padding: 14px 28px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .brand { display: flex; align-items: center; gap: 14px; }
-    .brand img { width: 42px; height: 42px; filter: drop-shadow(0 0 8px rgba(0, 242, 254, 0.4)); }
-    .brand-title h1 {
-      font-size: 1.25rem; font-weight: 700;
-      background: linear-gradient(90deg, var(--cyan), var(--blue));
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    }
-    .brand-title p { font-size: 0.78rem; color: var(--text-muted); }
-    .badge-group { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .badge {
-      font-size: 0.74rem; padding: 4px 10px; border-radius: 999px;
-      background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); color: var(--cyan);
-    }
-    .badge-purple {
-      background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); color: #d8b4fe;
-    }
-    .container {
-      max-width: 1280px; margin: 22px auto; padding: 0 20px;
-      display: grid; grid-template-columns: 1.12fr 0.88fr; gap: 22px;
-    }
-    @media (max-width: 980px) { .container { grid-template-columns: 1fr; } }
-    .card {
-      background: var(--bg-card); border: 1px solid var(--border);
-      border-radius: 14px; padding: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.35);
-    }
-    .card-full { grid-column: 1 / -1; }
-    .card-header {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 14px; padding-bottom: 10px;
-      border-bottom: 1px solid rgba(255,255,255,0.06); flex-wrap: wrap; gap: 8px;
-    }
-    .card-header h2 { font-size: 1.02rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-    label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 500; }
-    textarea, input[type="text"], input[type="number"], select {
-      width: 100%; background: var(--bg-input); border: 1px solid var(--border);
-      border-radius: 8px; color: var(--text-main); padding: 9px 12px;
-      font-size: 0.84rem; font-family: 'Consolas', 'Monaco', monospace; transition: border-color 0.2s;
-    }
-    textarea:focus, input:focus, select:focus {
-      outline: none; border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(0, 242, 254, 0.15);
-    }
-    textarea { min-height: 135px; resize: vertical; line-height: 1.45; }
-    .drop-zone {
-      border: 1.5px dashed rgba(0, 242, 254, 0.35);
-      border-radius: 10px;
-      padding: 8px;
-      transition: all 0.2s;
-      background: rgba(0, 242, 254, 0.02);
-    }
-    .drop-zone.drag-over {
-      border-color: var(--cyan);
-      background: rgba(0, 242, 254, 0.1);
-      box-shadow: 0 0 15px rgba(0, 242, 254, 0.2);
-    }
-    .drop-hint {
-      font-size: 0.74rem; color: var(--text-muted); margin-top: 5px;
-      display: flex; justify-content: space-between; align-items: center;
-    }
-    .proxy-section {
-      margin-top: 14px; padding: 12px; background: rgba(14, 20, 36, 0.65);
-      border: 1px solid rgba(168, 85, 247, 0.3); border-radius: 10px;
-    }
-    .proxy-header {
-      display: flex; justify-content: space-between; align-items: center;
-      margin-bottom: 8px; flex-wrap: wrap; gap: 6px;
-    }
-    .proxy-header h3 { font-size: 0.88rem; color: #e9d5ff; }
-    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-    .options-box {
-      margin-top: 12px; padding: 10px 12px; background: rgba(255,255,255,0.02);
-      border: 1px solid rgba(255,255,255,0.06); border-radius: 8px;
-      display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
-    }
-    .checkbox-row {
-      display: flex; align-items: center; gap: 7px; font-size: 0.79rem;
-      color: var(--text-main); cursor: pointer;
-    }
-    .checkbox-row input { width: auto; }
-    .btn-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
-    button {
-      cursor: pointer; border: none; border-radius: 8px; padding: 9px 15px;
-      font-size: 0.84rem; font-weight: 600; transition: all 0.2s;
-      display: inline-flex; align-items: center; gap: 6px;
-    }
-    .btn-primary {
-      background: linear-gradient(135deg, var(--cyan), var(--blue));
-      color: #06101e; box-shadow: 0 4px 14px rgba(0, 242, 254, 0.25);
-    }
-    .btn-primary:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(0, 242, 254, 0.4); }
-    .btn-amber {
-      background: rgba(245, 158, 11, 0.18); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.45);
-    }
-    .btn-amber:hover:not(:disabled) { background: rgba(245, 158, 11, 0.3); }
-    .btn-purple {
-      background: linear-gradient(135deg, #9333ea, #6366f1); color: #fff; padding: 5px 10px; font-size: 0.75rem;
-    }
-    .btn-secondary {
-      background: #1e293b; color: var(--text-main); border: 1px solid var(--border);
-    }
-    .btn-secondary:hover:not(:disabled) { background: #283548; border-color: var(--blue); }
-    .btn-danger {
-      background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4);
-    }
-    button:disabled { opacity: 0.45; cursor: not-allowed; }
-    .progress-box {
-      background: var(--bg-input); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px;
-    }
-    .progress-bar-bg { width: 100%; height: 12px; background: #1e293b; border-radius: 999px; overflow: hidden; margin: 10px 0; }
-    .progress-bar-fill {
-      height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--green)); transition: width 0.3s ease;
-    }
-    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
-    .stat-card {
-      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 8px; padding: 9px; text-align: center;
-    }
-    .stat-card .num { font-size: 1.25rem; font-weight: 700; }
-    .stat-card .lbl { font-size: 0.7rem; color: var(--text-muted); margin-top: 2px; }
-    .log-list {
-      max-height: 460px; overflow-y: auto; background: var(--bg-input);
-      border: 1px solid var(--border); border-radius: 8px; padding: 10px;
-      font-family: 'Consolas', monospace; font-size: 0.78rem;
-    }
-    .log-item {
-      padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04);
-      display: flex; justify-content: space-between; align-items: center; gap: 8px;
-    }
-    .log-item:last-child { border-bottom: none; }
-    .tag { padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; white-space: nowrap; }
-    .tag-ok { background: rgba(16, 185, 129, 0.2); color: #34d399; }
-    .tag-upd { background: rgba(0, 242, 254, 0.2); color: #00f2fe; }
-    .tag-skip { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
-    .tag-fail { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-    .tag-proxy { background: rgba(168, 85, 247, 0.2); color: #d8b4fe; margin-right: 4px; }
-    .file-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-    .file-table th, .file-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.06); }
-    .file-table th { color: var(--text-muted); font-weight: 600; font-size: 0.78rem; }
-    .file-link { color: var(--cyan); text-decoration: none; font-weight: 500; }
-    .file-link:hover { text-decoration: underline; }
-    .extractor-box { display: flex; gap: 8px; margin-top: 6px; }
-  </style>
-</head>
-<body>
-
-<header>
-  <div class="brand">
-    <img src="/assets/icon.svg" alt="AegisFetch" />
-    <div class="brand-title">
-      <h1>AegisFetch Web Console v__VERSION__</h1>
-      <p>Anti-403 WAF-Evading Catalog Downloader, BOM Importer &amp; Multi-Proxy IP Rotator</p>
-    </div>
-  </div>
-  <div class="badge-group">
-    <span class="badge">TLS: Chrome124 / Safari</span>
-    <span class="badge badge-purple" id="headerProxyBadge">Proxy: DIRECT</span>
-    <span class="badge">SSRF &amp; CSRF Guard: ACTIVE</span>
-    <button class="btn-secondary" style="padding:4px 10px; font-size:0.74rem;" onclick="copyExtensionToken()">🔑 拡張トークンをコピー</button>
-  </div>
-</header>
-
-<div class="container">
-  <!-- Left Card -->
-  <div class="card">
-    <div class="card-header">
-      <h2>📥 カタログ一括ダウンロード設定</h2>
-      <div style="display:flex; gap:6px;">
-        <input type="file" id="bomFileInput" accept=".txt,.csv,.xlsx" style="display:none;" onchange="handleBomFileSelect(this.files[0])" />
-        <button class="btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="document.getElementById('bomFileInput').click()">📄 Excel/CSV読込</button>
-        <button class="btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="loadSampleList()">サンプル挿入</button>
-      </div>
-    </div>
-
-    <label for="itemsInput">型番リスト（BALLUFF / 他社メーカー型番）または URL を1行ずつ入力:</label>
-    <div class="drop-zone" id="dropZone">
-      <textarea id="itemsInput" placeholder="ここに型番・URLを入力、または Excel (.xlsx) / CSV / TXT ファイルをドラッグ＆ドロップ！&#10;&#10;例:&#10;BES0002(BES G06EB-NOC40F-S49G)&#10;AM6-CN-3H&#10;https://example.com/datasheet.pdf"></textarea>
-      <div class="drop-hint">
-        <span>💡 Excel (.xlsx) / CSV / TXT のドラッグ＆ドロップに対応</span>
-        <span id="itemCountLabel">0 件</span>
-      </div>
-    </div>
-
-    <div style="margin-top: 12px;">
-      <label for="extractUrlInput">🔍 WebページからPDFリンクを自動抽出して上のリストに追加:</label>
-      <div class="extractor-box">
-        <input type="text" id="extractUrlInput" placeholder="https://www.balluff.com/ja-jp/products/BES0002" />
-        <button class="btn-secondary" id="btnExtract" onclick="extractLinksFromPage()" style="white-space:nowrap;">ページ解析</button>
-      </div>
-    </div>
-
-    <!-- Proxy Rotation Box -->
-    <div class="proxy-section">
-      <div class="proxy-header">
-        <h3>🌐 プロキシ自動ローテーション (1件ごとに別IPへ切替)</h3>
-        <div style="display:flex; gap:5px;">
-          <button class="btn-purple" id="btnHarvestProxies" onclick="harvestFreeProxies(true)">⚡ 無料プロキシ取得＆テスト</button>
-          <button class="btn-secondary" style="padding:4px 8px; font-size:0.73rem;" onclick="loadPresetProxies()">📋 プリセット</button>
-          <button class="btn-secondary" style="padding:4px 8px; font-size:0.73rem;" onclick="clearProxies()">クリア</button>
-        </div>
-      </div>
-      <textarea id="proxiesInput" style="min-height: 75px; font-size:0.78rem;" placeholder="http://176.111.37.5:39811&#10;socks5://208.102.51.6:58208 (空欄なら直接通信)" oninput="updateProxyCountBadge()"></textarea>
-      <div class="form-grid" style="margin-top:6px;">
-        <div>
-          <select id="proxyModeSelect" style="padding:6px 10px; font-size:0.78rem;">
-            <option value="round_robin" selected>順番に切替 (Round-Robin)</option>
-            <option value="random">ランダム切替 (Random)</option>
-          </select>
-        </div>
-        <div style="display:flex; align-items:center;">
-          <label class="checkbox-row" style="margin:0;">
-            <input type="checkbox" id="fallbackDirectCheck" checked />
-            <span>不通時は直接通信(Direct)で救済</span>
-          </label>
-        </div>
-      </div>
-    </div>
-
-    <div class="form-grid">
-      <div>
-        <label for="outputDir">保存先フォルダ (Output Dir):</label>
-        <input type="text" id="outputDir" value="__DEFAULT_DIR__" />
-      </div>
-      <div>
-        <label for="concurrencySelect">並列ダウンロード数 (⑦ 並列高速化):</label>
-        <select id="concurrencySelect">
-          <option value="1" selected>1 並列 (直列・最も安全)</option>
-          <option value="2">2 並列 (高速)</option>
-          <option value="3">3 並列 (プロキシ併用推奨)</option>
-          <option value="5">5 並列 (爆速・複数プロキシ向け)</option>
-        </select>
-      </div>
-      <div>
-        <label for="localeSelect">BALLUFF 優先言語:</label>
-        <select id="localeSelect">
-          <option value="ja-jp" selected>日本語 (ja-jp)</option>
-          <option value="en-us">English (en-us)</option>
-          <option value="de-de">Deutsch (de-de)</option>
-        </select>
-      </div>
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
-        <div>
-          <label for="minDelay">最小待機(秒):</label>
-          <input type="number" id="minDelay" value="0.6" step="0.2" min="0.2" />
-        </div>
-        <div>
-          <label for="maxDelay">最大待機(秒):</label>
-          <input type="number" id="maxDelay" value="1.5" step="0.2" min="0.4" />
-        </div>
-      </div>
-    </div>
-
-    <!-- Advanced Feature Toggles (6, 8, 9) -->
-    <div class="options-box">
-      <label class="checkbox-row">
-        <input type="checkbox" id="autoLocaleFallbackCheck" checked />
-        <span>⑥ 英語/独語 自動フォールバック</span>
-      </label>
-      <label class="checkbox-row">
-        <input type="checkbox" id="genericSearchCheck" checked />
-        <span>⑧ 他社型番もWeb自動検索 (PDF探索)</span>
-      </label>
-      <label class="checkbox-row" style="grid-column: 1 / -1;">
-        <input type="checkbox" id="checkUpdatesCheck" />
-        <span>⑨ カタログ改訂・更新チェック (既存ファイルの最新版をサーバー確認)</span>
-      </label>
-    </div>
-
-    <div class="btn-row">
-      <button class="btn-primary" id="btnStart" onclick="startDownloadJob()">🚀 ダウンロード開始</button>
-      <button class="btn-amber" id="btnRetryFailed" onclick="retryFailedItems()" disabled>🔄 失敗分のみ再試行</button>
-      <button class="btn-danger" id="btnCancel" onclick="cancelCurrentJob()" disabled>⏹ 停止</button>
-      <button class="btn-secondary" onclick="openOutputFolder()">📂 フォルダを開く</button>
-    </div>
-  </div>
-
-  <!-- Right Card -->
-  <div class="card">
-    <div class="card-header">
-      <h2>📊 リアルタイム実行ステータス</h2>
-      <span id="jobStatusBadge" class="badge">待機中 (IDLE)</span>
-    </div>
-
-    <div class="progress-box">
-      <div style="display:flex; justify-content:space-between; font-size:0.84rem; gap:10px;">
-        <span id="currentItemText" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">ジョブ開始待機中...</span>
-        <span id="progressPercent" style="white-space:nowrap;">0% (0/0)</span>
-      </div>
-      <div class="progress-bar-bg">
-        <div class="progress-bar-fill" id="progressBar"></div>
-      </div>
-      <div style="font-size:0.75rem; color:#d8b4fe; margin-top:4px;" id="activeProxyText">
-        現在の通信経路: DIRECT (標準回線)
-      </div>
-
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="num" id="statTotal" style="color:var(--text-main);">0</div>
-          <div class="lbl">総件数</div>
-        </div>
-        <div class="stat-card">
-          <div class="num" id="statSuccess" style="color:var(--green);">0</div>
-          <div class="lbl">成功 / 更新</div>
-        </div>
-        <div class="stat-card">
-          <div class="num" id="statSkipped" style="color:var(--amber);">0</div>
-          <div class="lbl">スキップ (既存)</div>
-        </div>
-        <div class="stat-card">
-          <div class="num" id="statFailed" style="color:var(--red);">0</div>
-          <div class="lbl">失敗</div>
-        </div>
-      </div>
-    </div>
-
-    <label>実行ログ (1件ごとの通信経路 / 言語・検索ソース / 結果):</label>
-    <div class="log-list" id="logList">
-      <div style="color:var(--text-muted); text-align:center; padding: 30px 0;">
-        左側のフォームに型番・URLを入力、または Excel/CSV をドロップしてください。
-      </div>
-    </div>
-  </div>
-
-  <!-- Bottom Card -->
-  <div class="card card-full">
-    <div class="card-header">
-      <h2>📁 ダウンロード済みカタログ一覧 (<span id="fileCountLabel">0</span> ファイル)</h2>
-      <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        <button class="btn-secondary" id="btnExportCsv" style="padding:6px 12px; font-size:0.8rem;" onclick="exportResultsCsv()" disabled>📊 結果CSV出力</button>
-        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="downloadAllZip()">📦 ZIP一括ダウンロード</button>
-        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="mergeAllPdfs()">📑 全PDFを1冊に結合</button>
-        <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshFileList()">🔄 一覧を更新</button>
-      </div>
-    </div>
-    <div style="max-height: 320px; overflow-y: auto;">
-      <table class="file-table">
-        <thead>
-          <tr>
-            <th>ファイル名 (クリックでブラウザ表示)</th>
-            <th>サイズ</th>
-            <th>更新日時</th>
-            <th>検証ステータス</th>
-          </tr>
-        </thead>
-        <tbody id="fileTableBody"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<script>
-  const EXTENSION_TOKEN = __EXTENSION_TOKEN_JSON__;
-  let activeJobId = null;
-  let pollTimer = null;
-  let lastFailedItems = [];
-  let lastJobResults = [];
-
-  function copyExtensionToken() {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(EXTENSION_TOKEN).then(() => {
-        alert("拡張機能連携用トークンをクリップボードにコピーしました！\\nChrome拡張の設定画面に貼り付けてください。");
-      }).catch(() => {
-        window.prompt("AegisFetch 拡張機能トークン (コピーしてください):", EXTENSION_TOKEN);
-      });
-    } else {
-      window.prompt("AegisFetch 拡張機能トークン (コピーしてください):", EXTENSION_TOKEN);
-    }
-  }
-
-  const SETTINGS_KEYS = [
-    'outputDir', 'proxiesInput', 'proxyModeSelect', 'concurrencySelect',
-    'localeSelect', 'minDelay', 'maxDelay', 'fallbackDirectCheck',
-    'autoLocaleFallbackCheck', 'genericSearchCheck', 'checkUpdatesCheck'
-  ];
-
-  function saveUiSettings() {
-    try {
-      const data = {};
-      for (const id of SETTINGS_KEYS) {
-        const el = document.getElementById(id);
-        if (!el) continue;
-        data[id] = (el.type === 'checkbox') ? el.checked : el.value;
-      }
-      localStorage.setItem('aegisfetch_ui_settings_v1', JSON.stringify(data));
-    } catch (e) {}
-  }
-
-  function restoreUiSettings() {
-    try {
-      const raw = localStorage.getItem('aegisfetch_ui_settings_v1');
-      if (!raw) return;
-      const data = JSON.parse(raw);
-      for (const id of SETTINGS_KEYS) {
-        const el = document.getElementById(id);
-        if (!el || !(id in data)) continue;
-        if (el.type === 'checkbox') el.checked = Boolean(data[id]);
-        else if (data[id] !== undefined && data[id] !== null) el.value = data[id];
-      }
-    } catch (e) {}
-  }
-
-  for (const id of SETTINGS_KEYS) {
-    const el = document.getElementById(id);
-    if (el) el.addEventListener('change', saveUiSettings);
-    if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
-      el.addEventListener('input', saveUiSettings);
-    }
-  }
-
-  function updateItemCount() {
-    const raw = document.getElementById('itemsInput').value;
-    const count = raw.split(/\\r?\\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#')).length;
-    document.getElementById('itemCountLabel').textContent = count + ' 件';
-  }
-  document.getElementById('itemsInput').addEventListener('input', updateItemCount);
-
-  // Drag & Drop BOM Handler
-  const dropZone = document.getElementById('dropZone');
-  dropZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    dropZone.classList.add('drag-over');
-  });
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-  dropZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    dropZone.classList.remove('drag-over');
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      handleBomFileSelect(e.dataTransfer.files[0]);
-    }
-  });
-
-  async function handleBomFileSelect(file) {
-    if (!file) return;
-    if (file.size > 5 * 1024 * 1024) {
-      alert("ファイルサイズが大きすぎます (上限 5MB)");
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const b64 = reader.result.split(',')[1];
-      try {
-        const resp = await fetch('/api/parse-file', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({filename: file.name, content_b64: b64})
-        });
-        const data = await resp.json();
-        if (!data.success) {
-          alert("ファイル解析エラー: " + data.message);
-          return;
-        }
-        const ta = document.getElementById('itemsInput');
-        const existing = ta.value.trim();
-        const loaded = (data.items || []).join("\\n");
-        ta.value = existing ? (existing + "\\n" + loaded) : loaded;
-        updateItemCount();
-        alert(`「${file.name}」から ${data.items.length} 件の型番/URLを読み込みました！`);
-      } catch (e) {
-        alert("通信エラー: " + e);
-      }
-    };
-    reader.readAsDataURL(file);
-  }
-
-  function loadSampleList() {
-    document.getElementById('itemsInput').value = [
-      "BES0002(BES G06EB-NOC40F-S49G)",
-      "BES0003(BES G06EB-NSC40F-S49G)",
-      "AM6-CN-3H"
-    ].join("\\n");
-    updateItemCount();
-  }
-
-  function getConfiguredProxies() {
-    const raw = document.getElementById('proxiesInput').value;
-    return raw.split(/\\r?\\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
-  }
-
-  function updateProxyCountBadge() {
-    const list = getConfiguredProxies();
-    const badge = document.getElementById('headerProxyBadge');
-    badge.textContent = list.length > 0 ? `Proxy: ACTIVE (${list.length} IPs)` : 'Proxy: DIRECT';
-  }
-
-  async function harvestFreeProxies(verifyLive) {
-    const btn = document.getElementById('btnHarvestProxies');
-    btn.disabled = true;
-    btn.textContent = "⏳ 収集＆生存テスト中(約4秒)...";
-    try {
-      const resp = await fetch('/api/free-proxies', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({verify_live: verifyLive, count: 12})
-      });
-      const data = await resp.json();
-      if (!data.success) {
-        alert("無料プロキシ取得エラー: " + (data.message || ""));
-        return;
-      }
-      document.getElementById('proxiesInput').value = (data.working_proxies || []).join("\\n");
-      updateProxyCountBadge();
-      alert(`公開リスト(${data.fetched_total}件)から高速応答プロキシ ${data.working_proxies.length} 件をセットしました！`);
-    } catch (e) {
-      alert("通信エラー: " + e);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "⚡ 無料プロキシ取得＆テスト";
-    }
-  }
-
-  async function loadPresetProxies() {
-    const resp = await fetch('/api/free-proxies', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({preset_only: true})
-    });
-    const data = await resp.json();
-    if (data.working_proxies) {
-      document.getElementById('proxiesInput').value = data.working_proxies.join("\\n");
-      updateProxyCountBadge();
-    }
-  }
-
-  function clearProxies() {
-    document.getElementById('proxiesInput').value = "";
-    updateProxyCountBadge();
-  }
-
-  async function extractLinksFromPage() {
-    const urlInput = document.getElementById('extractUrlInput');
-    const url = urlInput.value.trim();
-    if (!url) { alert("抽出元のWebページURLを入力してください。"); return; }
-    const btn = document.getElementById('btnExtract');
-    btn.disabled = true;
-    btn.textContent = "解析中...";
-    try {
-      const resp = await fetch('/api/extract', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({url})
-      });
-      const data = await resp.json();
-      if (!data.success) { alert("抽出エラー: " + (data.message || "")); return; }
-      if (data.pdf_links.length === 0) { alert("PDFリンクが見つかりませんでした。"); return; }
-      const ta = document.getElementById('itemsInput');
-      const existing = ta.value.trim();
-      const newUrls = data.pdf_links.map(x => x.url).join("\\n");
-      ta.value = existing ? (existing + "\\n" + newUrls) : newUrls;
-      updateItemCount();
-      urlInput.value = "";
-      alert(data.pdf_links.length + " 件のPDFリンクを追加しました！");
-    } catch (e) {
-      alert("通信エラー: " + e);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "ページ解析";
-    }
-  }
-
-  async function launchJobWithItems(items) {
-    const proxies = getConfiguredProxies();
-    const proxy_rotation_mode = document.getElementById('proxyModeSelect').value;
-    const fallback_to_direct = document.getElementById('fallbackDirectCheck').checked;
-    const output_dir = document.getElementById('outputDir').value.trim();
-    const locale = document.getElementById('localeSelect').value;
-    const concurrency = parseInt(document.getElementById('concurrencySelect').value, 10) || 1;
-    const auto_fallback_locales = document.getElementById('autoLocaleFallbackCheck').checked;
-    const enable_generic_search = document.getElementById('genericSearchCheck').checked;
-    const check_updates = document.getElementById('checkUpdatesCheck').checked;
-    const min_delay = parseFloat(document.getElementById('minDelay').value) || 0.6;
-    const max_delay = parseFloat(document.getElementById('maxDelay').value) || 1.5;
-
-    document.getElementById('btnStart').disabled = true;
-    document.getElementById('btnRetryFailed').disabled = true;
-    document.getElementById('btnCancel').disabled = false;
-    lastFailedItems = [];
-
-    try {
-      const resp = await fetch('/api/start', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          items, proxies, proxy_rotation_mode, fallback_to_direct,
-          output_dir, locale, concurrency, auto_fallback_locales,
-          enable_generic_search, check_updates, min_delay, max_delay
-        })
-      });
-      const data = await resp.json();
-      if (!data.success) {
-        alert("開始エラー: " + data.message);
-        document.getElementById('btnStart').disabled = false;
-        document.getElementById('btnCancel').disabled = true;
-        return;
-      }
-      activeJobId = data.job_id;
-      if (pollTimer) clearInterval(pollTimer);
-      pollJobStatus();
-      pollTimer = setInterval(pollJobStatus, 700);
-    } catch (e) {
-      alert("リクエスト失敗: " + e);
-      document.getElementById('btnStart').disabled = false;
-      document.getElementById('btnCancel').disabled = true;
-    }
-  }
-
-  function startDownloadJob() {
-    const rawText = document.getElementById('itemsInput').value;
-    const items = rawText.split(/\\r?\\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
-    if (items.length === 0) { alert("型番またはURLを1件以上入力してください。"); return; }
-    launchJobWithItems(items);
-  }
-
-  function retryFailedItems() {
-    if (lastFailedItems.length === 0) return;
-    document.getElementById('itemsInput').value = lastFailedItems.join("\\n");
-    updateItemCount();
-    launchJobWithItems(lastFailedItems);
-  }
-
-  async function cancelCurrentJob() {
-    if (!activeJobId) return;
-    await fetch('/api/cancel', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({job_id: activeJobId})
-    });
-  }
-
-  async function pollJobStatus() {
-    if (!activeJobId) return;
-    try {
-      const resp = await fetch('/api/job?job_id=' + encodeURIComponent(activeJobId));
-      const job = await resp.json();
-      if (!job.success) return;
-
-      document.getElementById('jobStatusBadge').textContent = job.status.toUpperCase();
-      document.getElementById('statTotal').textContent = job.total_items;
-      document.getElementById('statSuccess').textContent = job.success_count;
-      document.getElementById('statSkipped').textContent = job.skipped_count;
-      document.getElementById('statFailed').textContent = job.failed_count;
-
-      const pct = job.percent || 0;
-      document.getElementById('progressBar').style.width = pct + '%';
-      document.getElementById('progressPercent').textContent = `${pct}% (${job.completed_items}/${job.total_items})`;
-
-      if (job.last_proxy) {
-        document.getElementById('activeProxyText').textContent = `直近の通信経路 (IP): ${job.last_proxy}`;
-      }
-
-      const results = job.results || [];
-      lastJobResults = results;
-      renderLogs(results);
-
-      if (job.status === 'running') {
-        document.getElementById('currentItemText').textContent = "処理中: " + (job.current_item || "...");
-      } else {
-        document.getElementById('currentItemText').textContent = `完了 (${job.status})`;
-        document.getElementById('btnStart').disabled = false;
-        document.getElementById('btnCancel').disabled = true;
-        document.getElementById('btnExportCsv').disabled = (results.length === 0);
-        lastFailedItems = results.filter(r => !r.success).map(r => r.input);
-        document.getElementById('btnRetryFailed').disabled = (lastFailedItems.length === 0);
-        clearInterval(pollTimer);
-        refreshFileList();
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  function renderLogs(results) {
-    const container = document.getElementById('logList');
-    container.innerHTML = '';
-    const rev = [...results].reverse();
-    for (const r of rev) {
-      const row = document.createElement('div');
-      row.className = 'log-item';
-
-      const left = document.createElement('div');
-      left.style.overflow = 'hidden';
-      left.style.textOverflow = 'ellipsis';
-      left.style.whiteSpace = 'nowrap';
-      const srcLabel = r.source && r.source !== 'direct_url' ? ` (${r.source})` : '';
-      left.textContent = `[#${r.index}] ${r.input}${srcLabel} -> ${r.filename || r.error || ''}`;
-
-      const rightWrap = document.createElement('div');
-      rightWrap.style.display = 'flex';
-      rightWrap.style.alignItems = 'center';
-
-      if (r.proxy_used && r.proxy_used !== 'SKIPPED' && r.proxy_used !== 'UP-TO-DATE') {
-        const pTag = document.createElement('span');
-        pTag.className = 'tag tag-proxy';
-        pTag.textContent = r.proxy_used;
-        rightWrap.appendChild(pTag);
-      }
-
-      const right = document.createElement('span');
-      if (r.skipped) {
-        right.className = 'tag tag-skip';
-        right.textContent = r.proxy_used === 'UP-TO-DATE' ? `最新(SKIP)` : `SKIP (${r.size_kb} KB)`;
-      } else if (r.updated) {
-        right.className = 'tag tag-upd';
-        right.textContent = `UPDATED (${r.size_kb} KB)`;
-      } else if (r.success) {
-        right.className = 'tag tag-ok';
-        right.textContent = `OK (${r.size_kb} KB)`;
-      } else {
-        right.className = 'tag tag-fail';
-        right.textContent = 'FAILED';
-      }
-
-      rightWrap.appendChild(right);
-      row.appendChild(left);
-      row.appendChild(rightWrap);
-      container.appendChild(row);
-    }
-  }
-
-  async function refreshFileList() {
-    const outDir = document.getElementById('outputDir').value.trim();
-    try {
-      const resp = await fetch('/api/files?dir=' + encodeURIComponent(outDir));
-      const data = await resp.json();
-      const tbody = document.getElementById('fileTableBody');
-      tbody.innerHTML = '';
-      if (!data.success) return;
-
-      document.getElementById('fileCountLabel').textContent = data.files.length;
-      for (const f of data.files) {
-        const tr = document.createElement('tr');
-        const tdName = document.createElement('td');
-        const a = document.createElement('a');
-        a.className = 'file-link';
-        a.href = `/files/${encodeURIComponent(f.name)}?dir=${encodeURIComponent(data.directory)}`;
-        a.target = '_blank';
-        a.textContent = '📄 ' + f.name;
-        tdName.appendChild(a);
-
-        const tdSize = document.createElement('td');
-        tdSize.textContent = f.size_kb + ' KB';
-
-        const tdDate = document.createElement('td');
-        tdDate.textContent = f.modified;
-
-        const tdValid = document.createElement('td');
-        const badge = document.createElement('span');
-        badge.className = 'tag tag-ok';
-        badge.textContent = 'Verified PDF';
-        tdValid.appendChild(badge);
-
-        tr.appendChild(tdName);
-        tr.appendChild(tdSize);
-        tr.appendChild(tdDate);
-        tr.appendChild(tdValid);
-        tbody.appendChild(tr);
-      }
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  function exportResultsCsv() {
-    if (!lastJobResults || lastJobResults.length === 0) return;
-    const headers = ['No', 'Input', 'Filename', 'Status', 'SizeKB', 'Source', 'ProxyUsed', 'URL', 'Error', 'Time'];
-    const esc = (v) => {
-      let s = String(v === null || v === undefined ? '' : v);
-      // Neutralize CSV / Excel Formula Injection
-      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
-      return '"' + s.replace(/"/g, '""') + '"';
-    };
-    const rows = [headers.join(',')];
-    for (const r of lastJobResults) {
-      const st = r.skipped ? 'SKIPPED' : (r.updated ? 'UPDATED' : (r.success ? 'OK' : 'FAILED'));
-      rows.push([
-        esc(r.index), esc(r.input), esc(r.filename), esc(st),
-        esc(r.size_kb), esc(r.source), esc(r.proxy_used), esc(r.url), esc(r.error), esc(r.timestamp)
-      ].join(','));
-    }
-    const blob = new Blob(['\\uFEFF' + rows.join('\\r\\n')], {type: 'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'aegisfetch_report.csv';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
-  function downloadAllZip() {
-    const outDir = document.getElementById('outputDir').value.trim();
-    window.open('/api/download-zip?dir=' + encodeURIComponent(outDir), '_blank');
-  }
-
-  function mergeAllPdfs() {
-    const outDir = document.getElementById('outputDir').value.trim();
-    window.open('/api/merge-pdf?dir=' + encodeURIComponent(outDir), '_blank');
-  }
-
-  async function openOutputFolder() {
-    const outDir = document.getElementById('outputDir').value.trim();
-    await fetch('/api/open-folder', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({output_dir: outDir})
-    });
-  }
-
-  window.addEventListener('DOMContentLoaded', () => {
-    restoreUiSettings();
-    refreshFileList();
-    updateProxyCountBadge();
-    updateItemCount();
-  });
-</script>
-</body>
-</html>
-"""
+        _save_job_history()
 
 
 class AegisWebRequestHandler(BaseHTTPRequestHandler):
@@ -1278,7 +483,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _read_json_body(self) -> Dict[str, Any]:
+    def _read_json_body(self, max_bytes: int = 8 * 1024 * 1024) -> Dict[str, Any]:
         raw_cl = (self.headers.get("Content-Length") or "0").strip()
         try:
             length = int(raw_cl)
@@ -1286,8 +491,8 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Invalid Content-Length header.") from exc
         if length <= 0:
             return {}
-        if length > 8 * 1024 * 1024:
-            raise ValueError("Request body exceeds 8MB limit.")
+        if length > max_bytes:
+            raise ValueError(f"Request body exceeds {max_bytes // (1024 * 1024)}MB limit.")
         raw = self.rfile.read(length)
         parsed = json.loads(raw.decode("utf-8"))
         if not isinstance(parsed, dict):
@@ -1328,8 +533,9 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 .replace("&", "\\u0026")
             )
             safe_version = html.escape(__version__, quote=True)
+            html_template = _load_static_asset("index.html").decode("utf-8")
             page = (
-                HTML_DASHBOARD
+                html_template
                 .replace("__DEFAULT_DIR__", safe_default_dir)
                 .replace("__EXTENSION_TOKEN_JSON__", safe_token_json)
                 .replace("__VERSION__", safe_version)
@@ -1345,6 +551,28 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
 
+        if path == "/assets/style.css":
+            data = _load_static_asset("style.css")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/css; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if path == "/assets/app.js":
+            data = _load_static_asset("app.js")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if path == "/api/health":
             self._send_json({
                 "success": True,
@@ -1352,6 +580,25 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 "version": __version__,
                 "default_dir": DEFAULT_DOWNLOAD_DIR,
             })
+            return
+
+        if path == "/api/jobs":
+            with _UI_JOBS_LOCK:
+                jobs_list = []
+                for jid in reversed(list(_UI_JOBS.keys())[-MAX_PERSISTED_JOBS:]):
+                    j = _UI_JOBS[jid]
+                    jobs_list.append({
+                        "job_id": j.get("job_id"),
+                        "status": j.get("status"),
+                        "source": j.get("source", "webui"),
+                        "total_items": j.get("total_items", 0),
+                        "completed_items": j.get("completed_items", 0),
+                        "success_count": j.get("success_count", 0),
+                        "failed_count": j.get("failed_count", 0),
+                        "started_at": j.get("started_at"),
+                        "finished_at": j.get("finished_at"),
+                    })
+            self._send_json({"success": True, "jobs": jobs_list})
             return
 
         if path == "/assets/icon.svg":
@@ -1585,8 +832,9 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        max_json_bytes = 36 * 1024 * 1024 if path == "/api/save-browser-pdf" else 8 * 1024 * 1024
         try:
-            body = self._read_json_body()
+            body = self._read_json_body(max_bytes=max_json_bytes)
         except Exception as e:
             self._send_json({"success": False, "message": f"Invalid JSON: {e}"}, 400)
             return
@@ -1702,11 +950,13 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 return
 
             job_id = f"ui_{uuid.uuid4().hex[:8]}"
+            job_source = "extension" if self._get_validated_extension_origin() else "webui"
             with _UI_JOBS_LOCK:
                 _prune_old_ui_jobs()
                 _UI_JOBS[job_id] = {
                     "job_id": job_id,
                     "status": "running",
+                    "source": job_source,
                     "total_items": len(items),
                     "completed_items": 0,
                     "success_count": 0,
@@ -1765,6 +1015,59 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             try:
                 links = CatalogExtractor.extract_pdf_links_from_url(url)
                 self._send_json({"success": True, "pdf_links": links})
+            except Exception as e:
+                self._send_json({"success": False, "message": str(e)}, 400)
+            return
+
+        if path == "/api/save-browser-pdf":
+            if not self._get_validated_extension_origin() or not self._has_valid_extension_token():
+                self._send_json({
+                    "success": False,
+                    "error_code": "invalid_token",
+                    "message": "Extension authentication required."
+                }, 403)
+                return
+
+            raw_name = body.get("filename", "")
+            content_b64 = body.get("content_b64", "")
+            req_dir = body.get("output_dir") or DEFAULT_DOWNLOAD_DIR
+            if not isinstance(raw_name, str) or not isinstance(content_b64, str) or not raw_name.strip() or not content_b64:
+                self._send_json({"success": False, "message": "Missing filename or content_b64."}, 400)
+                return
+
+            try:
+                pdf_bytes = base64.b64decode(content_b64, validate=True)
+            except Exception:
+                self._send_json({"success": False, "message": "Invalid base64 payload."}, 400)
+                return
+
+            if len(pdf_bytes) < 512 or len(pdf_bytes) > MAX_BROWSER_PDF_BYTES:
+                self._send_json({"success": False, "message": "PDF size out of allowed bounds (512B..25MB)."}, 400)
+                return
+
+            if not pdf_bytes.startswith(b"%PDF"):
+                self._send_json({"success": False, "message": "Payload is not a valid PDF (%PDF header missing)."}, 400)
+                return
+
+            try:
+                target_dir = validate_output_directory(req_dir)
+                os.makedirs(target_dir, exist_ok=True)
+                safe_name = sanitize_filename(raw_name)
+                if not safe_name.lower().endswith(".pdf"):
+                    safe_name += ".pdf"
+                final_path = secure_output_path(target_dir, safe_name)
+                tmp_path = final_path + f".{threading.get_ident()}.tmp"
+                with open(tmp_path, "wb") as f:
+                    f.write(pdf_bytes)
+                os.replace(tmp_path, final_path)
+                self._send_json({
+                    "success": True,
+                    "filename": os.path.basename(final_path),
+                    "saved_path": final_path,
+                    "size_kb": round(len(pdf_bytes) / 1024, 2)
+                })
+            except SecurityValidationError as sve:
+                self._send_json({"success": False, "error_code": "security_validation_error", "message": str(sve)}, 403)
             except Exception as e:
                 self._send_json({"success": False, "message": str(e)}, 400)
             return

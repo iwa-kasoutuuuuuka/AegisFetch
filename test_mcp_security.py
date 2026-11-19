@@ -226,7 +226,7 @@ def test_extractor_and_background_jobs():
 
 async def main():
     print("==================================================================")
-    print("   AegisFetch v2.4.1 - Full Security, Proxy & Web UI Test Suite")
+    print("   AegisFetch v2.5.0 - Full Security, Proxy & Web UI Test Suite")
     print("==================================================================")
     await test_mcp_registration()
     test_ssrf_and_redirect_vulnerabilities()
@@ -485,9 +485,17 @@ def test_v22_advanced_features():
     xlsx_items = _parse_uploaded_bom_file("parts.xlsx", buf.getvalue())
     record_test("Excel (.xlsx) BOM parser extracts part & URL", xlsx_items == ["BES0003", "https://example.com/manual.pdf"])
 
-    # 3. Test BALLUFF detection & locale fallback (Feature 6 & 8)
+    # 3. Test BALLUFF detection & multi-manufacturer hints
     record_test("is_likely_balluff_code identifies BES0002", CatalogExtractor.is_likely_balluff_code("BES0002") is True)
     record_test("is_likely_balluff_code rejects AM6-CN-3H", CatalogExtractor.is_likely_balluff_code("AM6-CN-3H") is False)
+    record_test(
+        "detect_manufacturer_hint identifies OMRON / KEYENCE / SMC / MITSUBISHI",
+        (CatalogExtractor.detect_manufacturer_hint("E2E-X1R5E1") or {}).get("manufacturer") == "OMRON"
+        and (CatalogExtractor.detect_manufacturer_hint("LR-ZB100N") or {}).get("manufacturer") == "KEYENCE"
+        and (CatalogExtractor.detect_manufacturer_hint("SY3120-5LZD-C6") or {}).get("manufacturer") == "SMC"
+        and (CatalogExtractor.detect_manufacturer_hint("FX5U-32MR/ES") or {}).get("manufacturer") == "MITSUBISHI"
+        and CatalogExtractor.detect_manufacturer_hint("UNKNOWN-123") is None
+    )
 
     # 4. Test Parallel Multi-threaded Download & Revision Tracking (Feature 7 & 9)
     if not OFFLINE_MODE:
@@ -629,7 +637,8 @@ def test_chrome_extension_and_bridge():
         (not has_inline_handler) and (not has_inline_script_body)
     )
 
-    for js_name, js_path in (("popup.js", popup_js_path), ("background.js", bg_js_path)):
+    shared_js_path = os.path.join(ext_dir, "shared.js")
+    for js_name, js_path in (("shared.js", shared_js_path), ("popup.js", popup_js_path), ("background.js", bg_js_path)):
         with open(js_path, "r", encoding="utf-8") as f:
             js_src = f.read()
         unsafe_sink = (
@@ -638,7 +647,14 @@ def test_chrome_extension_and_bridge():
             or "document.write(" in js_src
         )
         record_test(f"{js_name} has no unsafe XSS sinks (innerHTML/eval/document.write)", not unsafe_sink)
-        record_test(f"{js_name} differentiates error_code on 403", "error_code" in js_src and "invalid_token" in js_src)
+        if js_name in ("popup.js", "background.js"):
+            record_test(f"{js_name} differentiates error_code on 403", "error_code" in js_src and "invalid_token" in js_src)
+
+    record_test(
+        "Manifest enables ES module service worker & optional custom local ports",
+        (manifest.get("background") or {}).get("type") == "module"
+        and "http://127.0.0.1:*/*" in manifest.get("optional_host_permissions", [])
+    )
 
     # 4. Local Bridge Security & Extension Auth Tests
     import urllib.parse
@@ -821,6 +837,82 @@ def test_chrome_extension_and_bridge():
                 all_400 = False
                 bad_details.append(f"{desc}->{st_m}")
         record_test("Web UI malformed POST payloads return HTTP 400 (no 500)", all_400, ", ".join(bad_details))
+
+        # 4m. Web UI separated static assets (/assets/style.css, /assets/app.js) & GET /api/jobs
+        st_css, hdr_css, raw_css = _req_raw("GET", "/assets/style.css")
+        st_js, hdr_js, raw_js = _req_raw("GET", "/assets/app.js")
+        record_test(
+            "Web UI serves separated /assets/style.css & /assets/app.js with nosniff",
+            st_css == 200 and st_js == 200
+            and b":root" in raw_css
+            and b"syncRecentJobs" in raw_js
+            and hdr_js.get("x-content-type-options") == "nosniff"
+        )
+
+        st_jobs, _, jobs_body = _req_status("GET", "/api/jobs")
+        record_test(
+            "Web UI GET /api/jobs returns job summary list",
+            st_jobs == 200 and jobs_body.get("success") is True and isinstance(jobs_body.get("jobs"), list)
+        )
+
+        # 4n. POST /api/save-browser-pdf security & functional verification
+        import base64
+        valid_pdf_b64 = base64.b64encode(b"%PDF-1.4\n" + b"A" * 600).decode("ascii")
+        bad_pdf_b64 = base64.b64encode(b"<html>login required</html>" + b"0" * 600).decode("ascii")
+
+        st_noauth, _, _ = _req_status(
+            "POST",
+            "/api/save-browser-pdf",
+            headers={"Origin": ext_origin, "Content-Type": "application/json"},
+            json_body={"filename": "auth.pdf", "content_b64": valid_pdf_b64, "output_dir": ref_dir},
+        )
+        st_badpdf, _, _ = _req_status(
+            "POST",
+            "/api/save-browser-pdf",
+            headers={"Origin": ext_origin, "Content-Type": "application/json", "X-Aegis-Token": web_ui.EXTENSION_TOKEN},
+            json_body={"filename": "auth.pdf", "content_b64": bad_pdf_b64, "output_dir": ref_dir},
+        )
+        st_okpdf, _, okpdf_body = _req_status(
+            "POST",
+            "/api/save-browser-pdf",
+            headers={"Origin": ext_origin, "Content-Type": "application/json", "X-Aegis-Token": web_ui.EXTENSION_TOKEN},
+            json_body={"filename": "../../member_only", "content_b64": valid_pdf_b64, "output_dir": ref_dir},
+        )
+        saved_member_path = os.path.join(ref_dir, "member_only.pdf")
+        record_test(
+            "Bridge POST /api/save-browser-pdf enforces auth, %PDF magic bytes & path confinement",
+            st_noauth == 403 and st_badpdf == 400 and st_okpdf == 200
+            and okpdf_body.get("filename") == "member_only.pdf"
+            and os.path.isfile(saved_member_path)
+        )
+
+        # 4o. Job history persistence (_save_job_history / _load_job_history)
+        hist_file = os.path.join(ref_dir, "test_history.json")
+        orig_hist_env = os.environ.get("AEGISFETCH_HISTORY_FILE")
+        os.environ["AEGISFETCH_HISTORY_FILE"] = hist_file
+        with web_ui._UI_JOBS_LOCK:
+            orig_jobs = dict(web_ui._UI_JOBS)
+            web_ui._UI_JOBS.clear()
+            web_ui._UI_JOBS["ui_hist1"] = {"job_id": "ui_hist1", "status": "running", "total_items": 1, "results": []}
+        try:
+            web_ui._save_job_history()
+            with web_ui._UI_JOBS_LOCK:
+                web_ui._UI_JOBS.clear()
+            web_ui._load_job_history()
+            with web_ui._UI_JOBS_LOCK:
+                reloaded = web_ui._UI_JOBS.get("ui_hist1")
+            record_test(
+                "Web UI job history persists & marks stale running jobs interrupted on reload",
+                reloaded is not None and reloaded.get("status") == "interrupted"
+            )
+        finally:
+            with web_ui._UI_JOBS_LOCK:
+                web_ui._UI_JOBS.clear()
+                web_ui._UI_JOBS.update(orig_jobs)
+            if orig_hist_env is None:
+                os.environ.pop("AEGISFETCH_HISTORY_FILE", None)
+            else:
+                os.environ["AEGISFETCH_HISTORY_FILE"] = orig_hist_env
     finally:
         bridge_server.shutdown()
         bridge_server.server_close()

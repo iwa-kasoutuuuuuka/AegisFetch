@@ -85,7 +85,7 @@ aegisfetch-ui
 Start_AegisFetch_WebUI.bat
 ```
 
-### 2. Chrome / Edge Extension (`AegisFetch Companion` - v2.4.1) / Chrome・Edge 拡張機能
+### 2. Chrome / Edge Extension (`AegisFetch Companion` - v2.5.0) / Chrome・Edge 拡張機能
 
 Send PDF links and selected part numbers directly from your everyday Chrome/Edge browser (even on login-protected or JS-rendered pages) to your local AegisFetch server:
 普段お使いの Chrome / Edge で開いているページ（要ログイン会員サイトや JS 動的ページを含む）から、ワンクリックや右クリックメニューで AegisFetch にダウンロードを送信できます：
@@ -204,10 +204,10 @@ AegisFetch v2.2 以降では、**1ファイルのダウンロードごとに別�
 
 ---
 
-## Security & Verification / セキュリティと脆弱性対策 (108/108 Tests Passing)
+## Security & Verification / セキュリティと脆弱性対策 (115/115 Tests Passing)
 
-AegisFetch v2.4.1 is built with deep-defense security guardrails audited across 108 automated tests (97 offline checks across Ubuntu & Windows GitHub Actions CI):
-AegisFetch v2.4.1 は多層防御セキュリティ設計に基づいており、108件の自動テスト（GitHub Actions CI 上の Ubuntu / Windows オフライン検証 97件を含む）で安全性を検証しています：
+AegisFetch v2.5.0 is built with deep-defense security guardrails audited across 115 automated tests (104 offline checks across Ubuntu & Windows GitHub Actions CI):
+AegisFetch v2.5.0 は多層防御セキュリティ設計に基づいており、115件の自動テスト（GitHub Actions CI 上の Ubuntu / Windows オフライン検証 104件を含む）で安全性を検証しています：
 
 - **Browser Extension Local Bridge Security / 拡張機能ローカルブリッジ認証**: Enforces `X-Aegis-Token` (`hmac.compare_digest`), strict `chrome-extension://` Origin + local Host validation (`[::1]` IPv6 & userinfo smuggling checks), `Cache-Control: no-store`, `0o600` POSIX token file permissions, strict MV3 CSP (`script-src 'self'`), zero unsafe DOM sinks (`textContent`-only), and `activeTab` least privilege. / `X-Aegis-Token` 検証（`hmac.compare_digest`）、`chrome-extension://` Origin とローカル Host 検証、`Cache-Control: no-store`、POSIX `0o600` トークンファイル権限、厳格な MV3 CSP、安全な DOM 操作（`textContent` のみ）、`activeTab` 最小権限を徹底しています。
 - **Direct, Open-Redirect (GET & HEAD), Playwright & Proxy-based SSRF Prevention / 多層SSRF防御**: Inspects every redirect hop (`301`/`302`/`307`/`308`) for GET/HEAD requests, Playwright subresource routes, `page_referer`, and proxy targets—blocking IPv4-mapped/6to4/Teredo/scoped IPv6, legacy `inet_aton` notations, `.localhost`, private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`). / GET/HEAD リダイレクト、Playwright 通信、`page_referer`、プロキシ設定のすべてでプライベートIP・ループバック・クラウドメタデータ・IPv6マップドIP・特殊IP表記・`.localhost` への到達を遮断します。
@@ -243,6 +243,9 @@ python test_mcp_security.py
 
 ## Changelog / 更新履歴
 
+- **v2.5.0**:
+  - **EN**: Enhanced Chrome/Edge MV3 extension & local bridge UX (`GET /api/jobs` auto-sync in Web UI, `POST /api/save-browser-pdf` for login-protected PDFs via active browser session, popup `concurrency`/`locale`/`check_updates` options, and shared ES module `chrome_extension/shared.js`); upgraded `extractors.py` with OMRON/KEYENCE/SMC/MITSUBISHI manufacturer prefix detection & 2-stage official-domain search; added atomic job history persistence (`~/.aegisfetch_ui_history.json`); separated Web UI static assets (`web_ui_static/`); and added Node.js 24 + `node --check` JS syntax verification in CI (**115/115 PASS** online, **104/104 PASS** offline CI).
+  - **JA**: Chrome/Edge 拡張と Web UI の連携を強化（Web UI 側の `GET /api/jobs` 自動同期、会員限定PDF向けのブラウザ認証セッション経由保存 `POST /api/save-browser-pdf`、拡張ポップアップでの並列数/言語/改訂チェック設定、`chrome_extension/shared.js` 共通モジュール化）。OMRON・KEYENCE・SMC・三菱電機向け2段階公式ドメイン検索、ジョブ履歴のローカル永続化、Web UI 静的ファイル分離（`web_ui_static/`）、CI での Node24 対応および JS 構文チェックを追加（オンライン **115/115 PASS**、オフラインCI **104/104 PASS**）。
 - **v2.4.1**:
   - **EN**: Hardened SSRF & proxy validation (IPv6-mapped/6to4/Teredo/scoped IPv6, legacy `inet_aton` notations, `.localhost`, CRLF/backslash authority confusion, Playwright `page.route` SSRF guard with clean teardown); fixed Web UI IPv6 `[::1]:port` Host parsing, `EXTENSION_TOKEN` JSON/Unicode escaping, `Cache-Control: no-store`, `0o600` token permissions, `/api/files` & `/files/` symlink/PDF confinement, and strict HTTP `400` validation; added `getSafePublicReferer()` and `error_code` 403 differentiation in the MV3 extension. Expanded test suite to **108/108 PASS** online (**97/97 PASS** offline CI).
   - **JA**: SSRF/プロキシ検証を強化（IPv6マップドIP・特殊IP表記・`.localhost`・CRLF・バックスラッシュ混乱・PlaywrightサブリソースSSRFの遮断）。Web UI の IPv6 `Host` 解析修正、トークンXSSエスケープと `Cache-Control: no-store`、`/files/` のシンボリックリンク・非PDF遮断、不正入力の HTTP `400` 応答を実装。拡張機能側でイントラネット `page_referer` 除外と 403 `error_code` 判別に対応（オンライン 108/108 PASS、オフラインCI 97/97 PASS）。

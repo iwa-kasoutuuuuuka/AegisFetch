@@ -129,6 +129,7 @@ body {
 
 input[type="text"],
 input[type="password"],
+select,
 textarea {
   width: 100%;
   background: var(--bg-input);
@@ -138,6 +139,27 @@ textarea {
   padding: 7px 9px;
   font-size: 12px;
   font-family: 'Consolas', monospace;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.checkbox-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-main);
+  margin-top: 8px;
+  cursor: pointer;
+}
+
+.checkbox-inline input {
+  width: auto;
 }
 
 input:focus,

@@ -12,7 +12,7 @@ Features:
 import re
 import html
 from urllib.parse import urljoin, quote_plus, urlparse, parse_qs, unquote
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 from curl_cffi import requests
 
 from security import validate_url, validate_redirect_target, MAX_REDIRECT_HOPS, SecurityValidationError
@@ -109,6 +109,22 @@ class CatalogExtractor:
     Resolves part numbers and product page URLs into downloadable PDF targets.
     """
 
+    MANUFACTURER_HINTS = [
+        (re.compile(r"^(?:E2E|E3Z|E3X|MY2N|MY4N|G3NA|G2R|NX-|NJ-|CP1|CJ2|S8VK)", re.I), "OMRON", ["omron.co.jp", "ia.omron.com"]),
+        (re.compile(r"^(?:LR-|IV3-|IV2-|FS-N|KV-|XG-|CV-|FD-Q|GT2-|IL-)", re.I), "KEYENCE", ["keyence.co.jp", "keyence.com"]),
+        (re.compile(r"^(?:SY[3579]|CQ2|CDQ2|ZSE|ISE|AR[234]0|AF[234]0|KQ2)", re.I), "SMC", ["smcworld.com"]),
+        (re.compile(r"^(?:FX5U|FX3U|MR-J[45]|FR-E8|FR-A8|GT2[157]|Q0[346])", re.I), "MITSUBISHI", ["mitsubishielectric.co.jp"]),
+    ]
+
+    @classmethod
+    def detect_manufacturer_hint(cls, part_input: str) -> Optional[Dict[str, Any]]:
+        """Detect likely FA manufacturer and official domains from part number prefix."""
+        raw = (part_input or "").strip()
+        for pattern, name, domains in cls.MANUFACTURER_HINTS:
+            if pattern.match(raw):
+                return {"manufacturer": name, "domains": domains}
+        return None
+
     @staticmethod
     def parse_balluff_code(raw_input: str) -> Tuple[str, str]:
         """
@@ -197,78 +213,106 @@ class CatalogExtractor:
         )
 
     @classmethod
+    def _run_ddg_pdf_query(
+        cls,
+        part_number: str,
+        query: str,
+        source_tag: str,
+        max_results: int,
+        session: requests.Session
+    ) -> List[Dict[str, str]]:
+        """Execute a single DuckDuckGo HTML PDF search query and validate returned URLs."""
+        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        candidates: List[Dict[str, str]] = []
+        seen = set()
+
+        resp = session.get(search_url, timeout=15)
+        if resp.status_code != 200:
+            resp.close()
+            return []
+        page_html = resp.text
+        resp.close()
+
+        raw_hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', page_html, re.I)
+        safe_part = re.sub(r"[^a-zA-Z0-9_\-]", "_", part_number.strip()).strip("_")
+
+        for href in raw_hrefs:
+            target_url = html.unescape(href)
+            if "uddg=" in target_url:
+                parsed = urlparse(target_url)
+                qs = parse_qs(parsed.query)
+                if "uddg" in qs and qs["uddg"]:
+                    target_url = unquote(qs["uddg"][0])
+
+            if not target_url.lower().startswith(("http://", "https://")):
+                continue
+            if "duckduckgo.com" in target_url.lower():
+                continue
+            if ".pdf" not in target_url.lower():
+                continue
+
+            try:
+                valid_u = validate_url(target_url)
+            except SecurityValidationError:
+                continue
+
+            if valid_u not in seen:
+                seen.add(valid_u)
+                idx = len(candidates) + 1
+                fname = f"{safe_part}.pdf" if idx == 1 else f"{safe_part}_alt{idx}.pdf"
+                candidates.append({
+                    "part_number": part_number,
+                    "url": valid_u,
+                    "filename": fname,
+                    "referer": "https://duckduckgo.com/",
+                    "source": source_tag
+                })
+                if len(candidates) >= max_results:
+                    break
+
+        return candidates
+
+    @classmethod
     def search_generic_datasheet(
         cls,
         part_number: str,
         max_results: int = 5,
-        session: Optional[requests.Session] = None
+        session: Optional[requests.Session] = None,
+        site_domains: Optional[List[str]] = None
     ) -> List[Dict[str, str]]:
         """
         Search the public web (via DuckDuckGo HTML) for datasheet PDF links matching any
-        manufacturer part number (e.g., Omron, Keyence, SMC, Micro Detectors, TI, etc.).
+        manufacturer part number (Omron, Keyence, SMC, Mitsubishi, TI, etc.).
+        Prioritizes official manufacturer domains when detected, then falls back to broad search.
         All discovered URLs are strictly validated against SSRF.
         """
-        query = f'"{part_number.strip()}" datasheet filetype:pdf'
-        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        clean_part = part_number.strip()
+        hint = cls.detect_manufacturer_hint(clean_part)
+        domains = site_domains if site_domains is not None else (hint["domains"] if hint else None)
+        mfr_tag = f"{hint['manufacturer'].lower()}_official_search" if hint else "generic_web_search"
 
         own_session = False
         if session is None:
             session = requests.Session(impersonate="chrome124")
             own_session = True
 
-        candidates: List[Dict[str, str]] = []
-        seen = set()
-
         try:
-            resp = session.get(search_url, timeout=15)
-            if resp.status_code != 200:
-                return []
-            page_html = resp.text
-            resp.close()
+            if domains:
+                site_filter = " OR ".join(f"site:{d}" for d in domains)
+                official_query = f'"{clean_part}" ({site_filter}) filetype:pdf'
+                official_hits = cls._run_ddg_pdf_query(
+                    clean_part, official_query, mfr_tag, max_results, session
+                )
+                if official_hits:
+                    return official_hits
 
-            # Extract DuckDuckGo result links (uddg=... or direct hrefs)
-            raw_hrefs = re.findall(r'href=[\'"]([^\'"]+)[\'"]', page_html, re.I)
-            safe_part = re.sub(r"[^a-zA-Z0-9_\-]", "_", part_number.strip()).strip("_")
-
-            for href in raw_hrefs:
-                target_url = html.unescape(href)
-                # Decode DuckDuckGo redirect wrapper: //duckduckgo.com/l/?uddg=https%3A%2F%2F...
-                if "uddg=" in target_url:
-                    parsed = urlparse(target_url)
-                    qs = parse_qs(parsed.query)
-                    if "uddg" in qs and qs["uddg"]:
-                        target_url = unquote(qs["uddg"][0])
-
-                if not target_url.lower().startswith(("http://", "https://")):
-                    continue
-                if "duckduckgo.com" in target_url.lower():
-                    continue
-                if ".pdf" not in target_url.lower():
-                    continue
-
-                try:
-                    valid_u = validate_url(target_url)
-                except SecurityValidationError:
-                    continue
-
-                if valid_u not in seen:
-                    seen.add(valid_u)
-                    idx = len(candidates) + 1
-                    fname = f"{safe_part}.pdf" if idx == 1 else f"{safe_part}_alt{idx}.pdf"
-                    candidates.append({
-                        "part_number": part_number,
-                        "url": valid_u,
-                        "filename": fname,
-                        "referer": "https://duckduckgo.com/",
-                        "source": "generic_web_search"
-                    })
-                    if len(candidates) >= max_results:
-                        break
+            broad_query = f'"{clean_part}" datasheet filetype:pdf'
+            return cls._run_ddg_pdf_query(
+                clean_part, broad_query, "generic_web_search", max_results, session
+            )
         finally:
             if own_session:
                 session.close()
-
-        return candidates
 
     @classmethod
     def resolve_any_part(

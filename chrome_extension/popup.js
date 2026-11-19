@@ -1,98 +1,51 @@
 "use strict";
 
-const DEFAULT_SERVER_URL = "http://127.0.0.1:8765";
+import {
+  DEFAULT_SERVER_URL,
+  isAllowedLocalServer,
+  normalizeServerOrigin,
+  getSafePublicReferer
+} from "./shared.js";
 
 let currentSettings = {
   serverUrl: DEFAULT_SERVER_URL,
   apiToken: "",
-  outputDir: ""
+  outputDir: "",
+  concurrency: 1,
+  locale: "ja-jp",
+  checkUpdates: false
 };
 let activePageUrl = "";
+let activeTabId = null;
 let pollTimer = null;
 let isSubmitting = false;
 
-function isPrivateOrLocalHostname(hostname) {
-  const h = (hostname || "").toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
-  if (!h || h === "localhost" || h.endsWith(".localhost")) {
-    return true;
-  }
-  if (!h.includes(".") && !h.includes(":")) {
-    return true;
-  }
-  if (h.includes(":")) {
-    return (
-      h === "::1" ||
-      h === "::" ||
-      h.startsWith("fc") ||
-      h.startsWith("fd") ||
-      h.startsWith("fe80") ||
-      h.startsWith("::ffff:")
-    );
-  }
-  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (ipv4Match) {
-    const a = Number(ipv4Match[1]);
-    const b = Number(ipv4Match[2]);
-    if (a === 127 || a === 10 || a === 0) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-  }
-  return false;
-}
-
-function getSafePublicReferer(urlStr, items) {
-  if (!urlStr || !Array.isArray(items)) {
-    return undefined;
-  }
-  const hasUrlItem = items.some((it) => /^https?:\/\//i.test((it || "").trim()));
-  if (!hasUrlItem) {
-    return undefined;
-  }
-  try {
-    const parsed = new URL(urlStr.trim());
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return undefined;
-    }
-    if (isPrivateOrLocalHostname(parsed.hostname)) {
-      return undefined;
-    }
-    return parsed.href;
-  } catch (e) {
-    return undefined;
-  }
-}
-
-function isAllowedLocalServer(urlStr) {
-  try {
-    const parsed = new URL((urlStr || "").trim());
-    return (
-      parsed.protocol === "http:" &&
-      (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost")
-    );
-  } catch (e) {
-    return false;
-  }
-}
-
-function normalizeServerOrigin(urlStr) {
-  const parsed = new URL(urlStr.trim());
-  return parsed.origin;
-}
-
 async function loadSettings() {
-  const stored = await chrome.storage.local.get(["serverUrl", "apiToken", "outputDir"]);
+  const stored = await chrome.storage.local.get([
+    "serverUrl",
+    "apiToken",
+    "outputDir",
+    "concurrency",
+    "locale",
+    "checkUpdates"
+  ]);
   currentSettings = {
     serverUrl: stored.serverUrl && isAllowedLocalServer(stored.serverUrl)
       ? normalizeServerOrigin(stored.serverUrl)
       : DEFAULT_SERVER_URL,
     apiToken: (stored.apiToken || "").trim(),
-    outputDir: (stored.outputDir || "").trim()
+    outputDir: (stored.outputDir || "").trim(),
+    concurrency: Number(stored.concurrency || 1),
+    locale: stored.locale || "ja-jp",
+    checkUpdates: Boolean(stored.checkUpdates)
   };
 
   document.getElementById("inputServerUrl").value = currentSettings.serverUrl;
   document.getElementById("inputToken").value = currentSettings.apiToken;
   document.getElementById("inputOutputDir").value = currentSettings.outputDir;
+  document.getElementById("selectConcurrency").value = String(currentSettings.concurrency);
+  document.getElementById("selectLocale").value = currentSettings.locale;
+  document.getElementById("chkUpdates").checked = currentSettings.checkUpdates;
 }
 
 async function apiFetch(path, options = {}) {
@@ -275,6 +228,31 @@ function injectedPageScanner() {
   return { selection, results };
 }
 
+async function injectedFetchPdfBase64(targetUrl) {
+  const resp = await fetch(targetUrl, { credentials: "include" });
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status}`);
+  }
+  const buf = await resp.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  if (bytes.length < 512) {
+    throw new Error("Payload too small");
+  }
+  // Check %PDF magic bytes
+  if (bytes[0] !== 0x25 || bytes[1] !== 0x50 || bytes[2] !== 0x44 || bytes[3] !== 0x46) {
+    throw new Error("Not a valid PDF (HTML/login page returned)");
+  }
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return {
+    b64: btoa(binary),
+    size: bytes.length
+  };
+}
+
 async function scanActiveTab() {
   const container = document.getElementById("pdfListContainer");
   try {
@@ -282,6 +260,7 @@ async function scanActiveTab() {
     const tab = tabs && tabs[0];
     if (!tab || !tab.id || !tab.url || (!tab.url.startsWith("http://") && !tab.url.startsWith("https://"))) {
       activePageUrl = "";
+      activeTabId = null;
       while (container.firstChild) container.removeChild(container.firstChild);
       const div = document.createElement("div");
       div.className = "pdf-empty";
@@ -293,6 +272,7 @@ async function scanActiveTab() {
     }
 
     activePageUrl = tab.url;
+    activeTabId = tab.id;
     const execRes = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: injectedPageScanner
@@ -312,6 +292,67 @@ async function scanActiveTab() {
     div.className = "pdf-empty";
     div.textContent = `スキャンに失敗しました: ${e.message || e}`;
     container.appendChild(div);
+  }
+}
+
+async function sendViaBrowserAuthSession(urls) {
+  const statusEl = document.getElementById("jobStatusText");
+  const barEl = document.getElementById("jobProgressBar");
+  const btnSelected = document.getElementById("btnSendSelected");
+  const btnQuick = document.getElementById("btnSendQuick");
+
+  if (!activeTabId || !urls || urls.length === 0 || isSubmitting) {
+    return;
+  }
+
+  isSubmitting = true;
+  if (btnSelected) btnSelected.disabled = true;
+  if (btnQuick) btnQuick.disabled = true;
+
+  let okCount = 0;
+  let failCount = 0;
+
+  try {
+    for (let i = 0; i < urls.length; i++) {
+      const u = urls[i];
+      const pct = Math.round(((i) / urls.length) * 100);
+      barEl.style.width = `${Math.max(5, pct)}%`;
+      statusEl.textContent = `認証セッション取得中 ${i + 1}/${urls.length}...`;
+
+      try {
+        const execRes = await chrome.scripting.executeScript({
+          target: { tabId: activeTabId },
+          func: injectedFetchPdfBase64,
+          args: [u]
+        });
+        const fetched = execRes && execRes[0] ? execRes[0].result : null;
+        if (!fetched || !fetched.b64) {
+          throw new Error("ブラウザ側でPDFを取得できませんでした");
+        }
+        const rawName = u.split("?")[0].split("/").pop() || `document_${i + 1}.pdf`;
+        const resp = await apiFetch("/api/save-browser-pdf", {
+          method: "POST",
+          body: JSON.stringify({
+            filename: rawName,
+            content_b64: fetched.b64,
+            output_dir: currentSettings.outputDir || undefined
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.success) {
+          throw new Error(data.message || `HTTP ${resp.status}`);
+        }
+        okCount++;
+      } catch (err) {
+        failCount++;
+      }
+    }
+    barEl.style.width = "100%";
+    statusEl.textContent = `ブラウザ認証完了: 成功 ${okCount} / 失敗 ${failCount}`;
+  } finally {
+    isSubmitting = false;
+    if (btnQuick) btnQuick.disabled = false;
+    if (btnSelected) updateSendSelectedState();
   }
 }
 
@@ -337,7 +378,10 @@ async function sendDownloadJob(items, pageReferer) {
     const payload = {
       items,
       page_referer: safeReferer,
-      output_dir: currentSettings.outputDir || undefined
+      output_dir: currentSettings.outputDir || undefined,
+      concurrency: currentSettings.concurrency,
+      locale: currentSettings.locale,
+      check_updates: currentSettings.checkUpdates
     };
 
     const resp = await apiFetch("/api/start", {
@@ -433,10 +477,15 @@ document.addEventListener("DOMContentLoaded", async () => {
       showSettingsNotice("セキュリティ保護のため http://127.0.0.1 または http://localhost のみ設定可能です。");
       return;
     }
+    const normalizedUrl = normalizeServerOrigin(rawUrl);
+
     currentSettings = {
-      serverUrl: normalizeServerOrigin(rawUrl),
+      serverUrl: normalizedUrl,
       apiToken: document.getElementById("inputToken").value.trim(),
-      outputDir: document.getElementById("inputOutputDir").value.trim()
+      outputDir: document.getElementById("inputOutputDir").value.trim(),
+      concurrency: Number(document.getElementById("selectConcurrency").value || 1),
+      locale: document.getElementById("selectLocale").value || "ja-jp",
+      checkUpdates: document.getElementById("chkUpdates").checked
     };
     await chrome.storage.local.set(currentSettings);
     const ok = await checkServerHealth();
@@ -484,7 +533,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     const urls = Array.from(document.querySelectorAll('#pdfListContainer input[type="checkbox"]:checked'))
       .map((cb) => cb.dataset.url)
       .filter(Boolean);
-    sendDownloadJob(urls, activePageUrl);
+    if (document.getElementById("chkBrowserAuthMode").checked) {
+      sendViaBrowserAuthSession(urls);
+    } else {
+      sendDownloadJob(urls, activePageUrl);
+    }
   });
 
   document.getElementById("btnSendQuick").addEventListener("click", () => {
