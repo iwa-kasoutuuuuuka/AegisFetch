@@ -178,10 +178,11 @@ AegisFetch v2.2 supports switching proxy IP on **every single file download** (R
 
 ---
 
-## Security & Verification / セキュリティと脆弱性対策 (59/59 Tests Passing)
+## Security & Verification / セキュリティと脆弱性対策 (61/61 Tests Passing)
 
-AegisFetch v2.2.0 is built with deep-defense security guardrails audited across 59 automated tests:
-- **Direct, Open-Redirect & Proxy-based SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) and proxy target, blocking private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
+AegisFetch v2.2.1 is built with deep-defense security guardrails audited across 61 automated tests:
+- **Direct, Open-Redirect (GET & HEAD) & Proxy-based SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) for both GET and revision-check HEAD requests as well as proxy targets, blocking private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
+- **XLSX ZIP Decompression Bomb Defense**: Pre-inspects uncompressed ZIP entry sizes in uploaded `.xlsx` BOM files (20MB cap, 5,000-row scan limit) before parsing.
 - **Web UI CSRF & DNS Rebinding Protection**: Strictly validates `Host` and `Origin` headers on local Web UI API endpoints (`127.0.0.1` / `localhost` only) and enforces `X-Frame-Options: DENY` & `X-Content-Type-Options: nosniff`.
 - **System Directory & Path Traversal Defense**: Blocks writes to critical OS folders (`C:\Windows`, `/etc`, Startup) and confines output paths via `os.path.commonpath`.
 - **Streamed Chunk Size Cutoff**: Streams downloads in 64KB chunks and aborts immediately if payload exceeds 100MB to prevent RAM/disk exhaustion.

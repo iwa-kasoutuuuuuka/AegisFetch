@@ -41,7 +41,7 @@ from security import (
 )
 from proxy_manager import ProxyRotator, fetch_and_test_free_proxies, mask_proxy_credentials
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 
 @dataclass
@@ -108,6 +108,7 @@ class AegisFetch:
 
         self._state_lock = threading.Lock()
         self._meta_lock = threading.Lock()
+        self._file_lock = threading.Lock()
         self._thread_local = threading.local()
         self.consecutive_failures = 0
 
@@ -220,9 +221,7 @@ class AegisFetch:
             tmp = p + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            if os.path.exists(p):
-                os.remove(p)
-            os.rename(tmp, p)
+            os.replace(tmp, p)
 
     def _check_file_validity(self, file_path: str) -> bool:
         if not os.path.exists(file_path):
@@ -237,57 +236,29 @@ class AegisFetch:
                 return header.startswith(b"%PDF")
         return True
 
-    def _has_remote_revision_changed(self, url: str, final_path: str, headers: Dict[str, str]) -> bool:
-        """
-        Check via HTTP HEAD whether the remote catalog has been revised compared to local metadata.
-        Returns True if an update/revision is detected, False if unchanged.
-        """
-        meta = self._load_meta()
-        fname = os.path.basename(final_path)
-        prev = meta.get(fname)
-        if not prev:
-            # No metadata recorded yet -> treat as needing check/download
-            return True
-
-        try:
-            self._ensure_thread_session(rotate_proxy=False)
-            resp = self.session.head(validate_url(url), headers=headers, allow_redirects=True, timeout=12)
-            if resp.status_code != 200:
-                resp.close()
-                return False
-
-            remote_etag = (resp.headers.get("ETag") or resp.headers.get("etag") or "").strip()
-            remote_lm = (resp.headers.get("Last-Modified") or resp.headers.get("last-modified") or "").strip()
-            remote_cl = (resp.headers.get("Content-Length") or resp.headers.get("content-length") or "").strip()
-            resp.close()
-
-            if remote_etag and prev.get("etag") and remote_etag != prev.get("etag"):
-                return True
-            if remote_lm and prev.get("last_modified") and remote_lm != prev.get("last_modified"):
-                return True
-            if remote_cl and remote_cl.isdigit() and prev.get("size_bytes") and int(remote_cl) != int(prev.get("size_bytes")):
-                return True
-
-            return False
-        except Exception:
-            return False
-
-    def _get_with_safe_redirects(
+    def _request_with_safe_redirects(
         self,
+        method: str,
         url: str,
         headers: Dict[str, str],
         stream: bool = True,
         timeout: int = 20
     ) -> requests.Response:
+        """
+        Execute GET or HEAD request while validating every HTTP redirect hop against SSRF.
+        """
         current_url = validate_url(url)
         for _ in range(MAX_REDIRECT_HOPS):
-            resp = self.session.get(
-                current_url,
-                headers=headers,
-                allow_redirects=False,
-                stream=stream,
-                timeout=timeout
-            )
+            req_fn = self.session.head if method.upper() == "HEAD" else self.session.get
+            kwargs: Dict[str, Any] = {
+                "headers": headers,
+                "allow_redirects": False,
+                "timeout": timeout,
+            }
+            if method.upper() != "HEAD":
+                kwargs["stream"] = stream
+
+            resp = req_fn(current_url, **kwargs)
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("Location") or resp.headers.get("location")
                 resp.close()
@@ -296,6 +267,56 @@ class AegisFetch:
             return resp
 
         raise SecurityValidationError(f"Exceeded maximum redirect hops ({MAX_REDIRECT_HOPS}).")
+
+    def _get_with_safe_redirects(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        stream: bool = True,
+        timeout: int = 20
+    ) -> requests.Response:
+        return self._request_with_safe_redirects("GET", url, headers=headers, stream=stream, timeout=timeout)
+
+    def _has_remote_revision_changed(self, url: str, final_path: str, headers: Dict[str, str]) -> bool:
+        """
+        Check via SSRF-safe HTTP HEAD whether the remote catalog has been revised compared to local metadata.
+        Returns True if an update/revision is detected, False if unchanged.
+        """
+        meta = self._load_meta()
+        fname = os.path.basename(final_path)
+        prev = meta.get(fname)
+        if not prev:
+            return True
+
+        try:
+            self._ensure_thread_session(rotate_proxy=False)
+            resp = self._request_with_safe_redirects("HEAD", url, headers=headers, stream=False, timeout=12)
+            if resp.status_code != 200:
+                resp.close()
+                return False
+
+            remote_etag = (resp.headers.get("ETag") or resp.headers.get("etag") or "").strip()
+            remote_lm = (resp.headers.get("Last-Modified") or resp.headers.get("last-modified") or "").strip()
+            remote_date = (resp.headers.get("Date") or resp.headers.get("date") or "").strip()
+            remote_cl = (resp.headers.get("Content-Length") or resp.headers.get("content-length") or "").strip()
+            resp.close()
+
+            if remote_etag and prev.get("etag") and remote_etag != prev.get("etag"):
+                return True
+
+            # Ignore Last-Modified when a dynamic PDF generator simply echoes the current server Date
+            is_dynamic_lm = bool(remote_lm and remote_date and remote_lm == remote_date)
+            if remote_lm and not is_dynamic_lm and prev.get("last_modified") and remote_lm != prev.get("last_modified"):
+                return True
+
+            if remote_cl and remote_cl.isdigit() and prev.get("size_bytes") and int(remote_cl) != int(prev.get("size_bytes")):
+                return True
+
+            return False
+        except SecurityValidationError:
+            raise
+        except Exception:
+            return False
 
     def _stream_to_temp_file(self, resp: requests.Response, temp_path: str, is_pdf: bool) -> Dict[str, Any]:
         cl_header = resp.headers.get("Content-Length") or resp.headers.get("content-length")
@@ -378,15 +399,24 @@ class AegisFetch:
                     skipped=True,
                     proxy_used="SKIPPED"
                 )
-            # Revision check enabled
-            if not self._has_remote_revision_changed(url, final_path, headers):
+            # Revision check enabled (SSRF-safe HEAD)
+            try:
+                if not self._has_remote_revision_changed(url, final_path, headers):
+                    return DownloadResult(
+                        url=url,
+                        save_path=final_path,
+                        success=True,
+                        size_bytes=os.path.getsize(final_path),
+                        skipped=True,
+                        proxy_used="UP-TO-DATE"
+                    )
+            except SecurityValidationError as sve:
                 return DownloadResult(
                     url=url,
                     save_path=final_path,
-                    success=True,
-                    size_bytes=os.path.getsize(final_path),
-                    skipped=True,
-                    proxy_used="UP-TO-DATE"
+                    success=False,
+                    error_msg=f"SecurityValidationError: {sve}",
+                    proxy_used="BLOCKED"
                 )
             is_revision_update = True
 
@@ -447,9 +477,8 @@ class AegisFetch:
                     meta_info = self._stream_to_temp_file(resp, temp_path, is_pdf=is_pdf)
                     resp.close()
 
-                    if os.path.exists(final_path):
-                        os.remove(final_path)
-                    os.rename(temp_path, final_path)
+                    with self._file_lock:
+                        os.replace(temp_path, final_path)
 
                     # Persist revision metadata
                     self._save_meta_entry(safe_filename, {

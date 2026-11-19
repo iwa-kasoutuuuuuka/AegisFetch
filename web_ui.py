@@ -24,6 +24,7 @@ import uuid
 import time
 import json
 import base64
+import zipfile
 import threading
 import webbrowser
 import argparse
@@ -52,31 +53,52 @@ _UI_JOBS_LOCK = threading.Lock()
 _UI_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
+MAX_BOM_SCAN_ROWS = 5000
+MAX_BOM_EXTRACTED_ITEMS = 1000
+MAX_XLSX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024  # 20MB uncompressed limit (ZIP bomb defense)
+
+
 def _parse_uploaded_bom_file(filename: str, raw_bytes: bytes) -> List[str]:
     """
     Parse .txt, .csv, or .xlsx BOM files and extract part numbers / URLs.
+    Includes ZIP decompression bomb defense and row/item caps.
     """
     ext = os.path.splitext(filename.lower())[1]
     extracted: List[str] = []
     seen = set()
 
-    def _add_token(val: str):
+    def _add_token(val: str) -> bool:
+        if len(extracted) >= MAX_BOM_EXTRACTED_ITEMS:
+            return False
         s = (val or "").strip()
         if not s or s.startswith("#"):
-            return
-        # Skip common header labels
+            return True
         if s.lower() in ("part", "part_number", "model", "type", "url", "型式", "型番", "品番", "order_code", "name"):
-            return
+            return True
         if s not in seen:
             seen.add(s)
             extracted.append(s)
+        return True
 
     if ext == ".xlsx":
+        # ZIP Bomb Protection: inspect uncompressed size before handing to openpyxl
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                total_uncompressed = sum(info.file_size for info in zf.infolist())
+                if total_uncompressed > MAX_XLSX_UNCOMPRESSED_BYTES:
+                    raise SecurityValidationError(
+                        f"XLSX uncompressed size ({total_uncompressed} bytes) exceeds 20MB limit (ZIP Bomb Protection)."
+                    )
+        except zipfile.BadZipFile:
+            raise ValueError("Invalid or corrupted .xlsx file.")
+
         import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
         try:
             ws = wb.active
-            for row in ws.iter_rows(values_only=True):
+            for row_idx, row in enumerate(ws.iter_rows(values_only=True), 1):
+                if row_idx > MAX_BOM_SCAN_ROWS or len(extracted) >= MAX_BOM_EXTRACTED_ITEMS:
+                    break
                 for cell in row:
                     if cell is not None:
                         text = str(cell).strip()
@@ -84,13 +106,15 @@ def _parse_uploaded_bom_file(filename: str, raw_bytes: bytes) -> List[str]:
                             len(text) >= 4 and any(ch.isdigit() for ch in text) and any(ch.isalpha() for ch in text)
                         ):
                             _add_token(text)
-                            break  # Take first plausible part/URL column per row
+                            break
         finally:
             wb.close()
     elif ext == ".csv":
         text = raw_bytes.decode("utf-8-sig", errors="replace")
         reader = csv.reader(io.StringIO(text))
-        for row in reader:
+        for row_idx, row in enumerate(reader, 1):
+            if row_idx > MAX_BOM_SCAN_ROWS or len(extracted) >= MAX_BOM_EXTRACTED_ITEMS:
+                break
             for cell in row:
                 c = cell.strip()
                 if c.lower().startswith(("http://", "https://")) or (
@@ -99,9 +123,10 @@ def _parse_uploaded_bom_file(filename: str, raw_bytes: bytes) -> List[str]:
                     _add_token(c)
                     break
     else:
-        # .txt or generic line-separated
         text = raw_bytes.decode("utf-8-sig", errors="replace")
-        for line in text.splitlines():
+        for row_idx, line in enumerate(text.splitlines(), 1):
+            if row_idx > MAX_BOM_SCAN_ROWS or len(extracted) >= MAX_BOM_EXTRACTED_ITEMS:
+                break
             _add_token(line)
 
     return extracted
@@ -1158,6 +1183,13 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._is_safe_local_request(is_post=True):
+            # Drain small unread POST body to prevent Windows TCP RST (WinError 10054) on early 403 close
+            try:
+                cl = int(self.headers.get("Content-Length", "0"))
+                if 0 < cl <= 65536:
+                    self.rfile.read(cl)
+            except Exception:
+                pass
             self._send_json({"success": False, "message": "Forbidden Origin/Host header (CSRF & DNS Rebinding Protection)."}, 403)
             return
 

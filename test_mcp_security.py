@@ -204,7 +204,7 @@ def test_extractor_and_background_jobs():
 
 async def main():
     print("==================================================================")
-    print("   AegisFetch v2.1.1 - Full Security, Proxy & Web UI Test Suite")
+    print("   AegisFetch v2.2.1 - Full Security, Proxy & Web UI Test Suite")
     print("==================================================================")
     await test_mcp_registration()
     test_ssrf_and_redirect_vulnerabilities()
@@ -470,8 +470,37 @@ def test_v22_advanced_features():
     hits = CatalogExtractor.search_generic_datasheet("LM358", max_results=3)
     record_test(
         "Generic datasheet search finds valid public PDF links for non-BALLUFF part (LM358)",
-        isinstance(hits, list) and len(hits) >= 0  # Ensure clean execution without crash/SSRF
+        isinstance(hits, list) and len(hits) >= 0
     )
+
+    # 6. Test XLSX ZIP Decompression Bomb Defense (v2.2.1 Security)
+    import zipfile
+    bomb_buf = io.BytesIO()
+    with zipfile.ZipFile(bomb_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/worksheets/sheet1.xml", b"A" * (22 * 1024 * 1024))  # 22MB zeros compresses to ~25KB
+    bomb_blocked = False
+    try:
+        _parse_uploaded_bom_file("bomb.xlsx", bomb_buf.getvalue())
+    except SecurityValidationError:
+        bomb_blocked = True
+    record_test("XLSX ZIP Bomb Defense blocks >20MB uncompressed archive", bomb_blocked)
+
+    # 7. Test SSRF-safe HEAD request in Revision Check (v2.2.1 Security)
+    head_ssrf_dir = "e:/temp/test_head_ssrf"
+    try:
+        f_head = AegisFetch(output_dir=head_ssrf_dir, check_updates=True, quiet=True)
+        # Seed dummy file and meta so HEAD check triggers
+        dummy_pdf = os.path.join(head_ssrf_dir, "test.pdf")
+        with open(dummy_pdf, "wb") as fp:
+            fp.write(b"%PDF-1.4\n" + b"0" * 600)
+        f_head._save_meta_entry("test.pdf", {"etag": "v1", "size_bytes": 609})
+        res_head = f_head.download_file("http://127.0.0.1:8080/internal.pdf", filename="test.pdf", check_updates=True)
+        record_test(
+            "Revision Check HEAD request blocks SSRF internal IP",
+            res_head.success is False and "SecurityValidationError" in (res_head.error_msg or "")
+        )
+    finally:
+        shutil.rmtree(head_ssrf_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
