@@ -23,12 +23,12 @@ import webbrowser
 import argparse
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 from typing import Dict, Any, List, Optional
 
 from aegisfetch import AegisFetch, __version__
 from extractors import CatalogExtractor
-from proxy_manager import fetch_and_test_free_proxies, DEFAULT_FREE_PROXIES
+from proxy_manager import fetch_and_test_free_proxies, DEFAULT_FREE_PROXIES, mask_proxy_credentials
 from security import (
     validate_url,
     validate_output_directory,
@@ -124,7 +124,7 @@ def _run_ui_download_job(
                     "success": False,
                     "skipped": False,
                     "size_kb": 0,
-                    "proxy_used": fetcher.current_proxy or "DIRECT",
+                    "proxy_used": mask_proxy_credentials(fetcher.current_proxy),
                     "error": str(e),
                     "timestamp": time.strftime("%H:%M:%S")
                 }
@@ -987,10 +987,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
 
 class AegisWebRequestHandler(BaseHTTPRequestHandler):
-    """HTTP Handler for AegisFetch Web UI Console."""
+    """HTTP Handler for AegisFetch Web UI Console with CSRF & DNS Rebinding Protection."""
 
     def log_message(self, format: str, *args: Any):
         pass
+
+    def _is_safe_local_request(self, is_post: bool = False) -> bool:
+        """
+        Verify Host and Origin headers to defend against DNS Rebinding and Cross-Site Request Forgery (CSRF).
+        """
+        host = (self.headers.get("Host") or "").lower().strip()
+        host_only = host.split(":")[0]
+        if host_only not in ("127.0.0.1", "localhost", "[::1]", ""):
+            return False
+
+        if is_post:
+            origin = (self.headers.get("Origin") or "").lower().strip()
+            if origin:
+                parsed_orig = urlparse(origin)
+                if parsed_orig.hostname not in ("127.0.0.1", "localhost", "::1"):
+                    return False
+        return True
 
     def _send_json(self, data: Dict[str, Any], status: int = 200):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -998,6 +1015,8 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(raw)
 
@@ -1009,11 +1028,14 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def do_GET(self):
+        if not self._is_safe_local_request(is_post=False):
+            self._send_json({"success": False, "message": "Forbidden Host header (DNS Rebinding Protection)."}, 403)
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path
-        query = dict(
-            part.split("=", 1) for part in parsed.query.split("&") if "=" in part
-        )
+        qs = parse_qs(parsed.query)
+        query = {k: v[0] for k, v in qs.items() if v}
 
         if path == "/" or path == "/index.html":
             page = HTML_DASHBOARD.replace("__DEFAULT_DIR__", DEFAULT_DOWNLOAD_DIR.replace("\\", "/"))
@@ -1021,6 +1043,8 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
             self.end_headers()
             self.wfile.write(raw)
             return
@@ -1110,6 +1134,10 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        if not self._is_safe_local_request(is_post=True):
+            self._send_json({"success": False, "message": "Forbidden Origin/Host header (CSRF & DNS Rebinding Protection)."}, 403)
+            return
+
         parsed = urlparse(self.path)
         path = parsed.path
 

@@ -35,9 +35,9 @@ from security import (
     DEFAULT_MAX_FILE_SIZE,
     MAX_REDIRECT_HOPS,
 )
-from proxy_manager import ProxyRotator, fetch_and_test_free_proxies
+from proxy_manager import ProxyRotator, fetch_and_test_free_proxies, mask_proxy_credentials
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 
 @dataclass
@@ -300,7 +300,7 @@ class AegisFetch:
             if use_direct_fallback:
                 self._init_session(rotate_proxy=False, force_direct=True)
 
-            active_route = self.current_proxy or "DIRECT"
+            active_route = mask_proxy_credentials(self.current_proxy)
             req_timeout = 12 if self.current_proxy else 25
 
             try:
@@ -388,7 +388,7 @@ class AegisFetch:
             success=False,
             status_code=last_status,
             error_msg=last_error,
-            proxy_used=self.current_proxy or "DIRECT"
+            proxy_used=mask_proxy_credentials(self.current_proxy)
         )
 
     def download_batch(

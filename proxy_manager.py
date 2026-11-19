@@ -10,10 +10,13 @@ Provides:
 import re
 import time
 import random
+import ipaddress
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Tuple
 from curl_cffi import requests
+
+from security import BLOCKED_NETWORKS, BLOCKED_HOSTNAMES
 
 # Verified high-uptime public proxy sources (updated every 5-15 mins on GitHub)
 FREE_PROXY_SOURCES = [
@@ -41,10 +44,24 @@ DEFAULT_FREE_PROXIES = [
 ALLOWED_PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://", "socks4://")
 
 
-def normalize_proxy_url(raw: str, default_scheme: str = "http://") -> Optional[str]:
+def mask_proxy_credentials(proxy_url: Optional[str]) -> str:
+    """
+    Mask username/password inside a proxy URL before logging or returning to UI/MCP.
+    Example: 'http://admin:secret@1.2.3.4:8080' -> 'http://***:***@1.2.3.4:8080'
+    """
+    if not proxy_url:
+        return "DIRECT"
+    return re.sub(r"://([^:@\s]+):([^:@\s]+)@", "://***:***@", proxy_url)
+
+
+def normalize_proxy_url(
+    raw: str,
+    default_scheme: str = "http://",
+    block_private_ip: bool = True
+) -> Optional[str]:
     """
     Normalize a raw proxy entry like '203.0.113.10:8080' or 'socks5://1.2.3.4:1080'
-    into a valid proxy URL string. Returns None if invalid.
+    into a valid proxy URL string. Blocks private/internal IPs by default (Proxy-SSRF protection).
     """
     if not raw or not isinstance(raw, str):
         return None
@@ -66,9 +83,21 @@ def normalize_proxy_url(raw: str, default_scheme: str = "http://") -> Optional[s
     if not m:
         return None
 
+    host = m.group(1).lower()
     port = int(m.group(2))
     if not (1 <= port <= 65535):
         return None
+
+    if block_private_ip:
+        if host in BLOCKED_HOSTNAMES:
+            return None
+        try:
+            ip = ipaddress.ip_address(host)
+            for net in BLOCKED_NETWORKS:
+                if ip in net:
+                    return None
+        except ValueError:
+            pass
 
     return s.rstrip("/")
 

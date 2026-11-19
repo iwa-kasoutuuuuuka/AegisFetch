@@ -123,10 +123,10 @@ results = client.download_batch(items)
 
 ---
 
-### Model Context Protocol (MCP) Server / MCPサーバー (v2.0)
+### Model Context Protocol (MCP) Server / MCPサーバー (v2.1.1)
 
 AegisFetch includes a native MCP server for seamless integration with **Antigravity**, **Claude Code**, and **Claude Desktop**.
-Antigravity や Claude Code から直接ツール呼び出しでダウンロード・型番解決・非同期バッチ処理を実行できます。
+Antigravity や Claude Code から直接ツール呼び出しでダウンロード・型番解決・無料プロキシ取得・非同期バッチ処理を実行できます。
 
 #### 1. Configuration / 設定例 (`claude_desktop_config.json` / Antigravity)
 
@@ -143,27 +143,39 @@ Antigravity や Claude Code から直接ツール呼び出しでダウンロー�
 }
 ```
 
-#### 2. Available MCP Tools (8 Tools) / 提供ツール一覧
+#### 2. Available MCP Tools (9 Tools) / 提供ツール一覧
 
 - `aegisfetch_download_single`: Download a single document with WAF evasion and hop-by-hop SSRF guards.
 - `aegisfetch_download_by_part_number`: Automatically resolve part numbers (e.g. `BES0002`) into official PDF URLs and download them.
 - `aegisfetch_extract_pdf_links`: Scan a product webpage and extract all PDF links (with automatic Playwright SPA fallback).
 - `aegisfetch_download_batch`: Synchronous batch download (up to 50 items) with jitter and circuit breaker protection.
-- `aegisfetch_start_batch_job`: Start a non-blocking background job (up to 500 items) to avoid MCP 60s tool timeouts.
+- `aegisfetch_start_batch_job`: Start a non-blocking background job (up to 500 items, supports `proxies` rotation) to avoid MCP 60s tool timeouts.
 - `aegisfetch_get_job_status`: Check real-time progress and results of a background download job.
+- `aegisfetch_fetch_free_proxies`: Harvest & live-test public HTTP/SOCKS5 proxies against Cloudflare HTTPS trace.
 - `aegisfetch_verify_file`: Validate local file integrity (`%PDF` magic byte check).
 - `aegisfetch_get_status`: Report server health, active jobs, and active security guardrails.
 
 ---
 
-## Security & Verification / セキュリティと脆弱性対策 (30/30 Tests Passing)
+## Multi-Proxy IP Rotation & Free Proxy Harvester / 複数プロキシ自動ローテーション
 
-AegisFetch v2.0 is built with deep-defense security guardrails:
-- **Direct & Open-Redirect SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) and blocks private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
+AegisFetch v2.1 supports switching proxy IP on **every single file download** (Round-Robin or Random):
+- **Web UI Integration**: Paste multiple proxies into the dashboard or click **"⚡ 無料プロキシを自動取得＆生存テスト"** to harvest & verify live proxies in ~4 seconds.
+- **Dead-Proxy Eviction & Direct Fallback**: Automatically drops broken proxies and falls back to direct connection on the final retry so downloads succeed reliably.
+- **Credential Masking**: Proxy passwords (`http://user:pass@host:port`) are automatically masked as `***:***` in all logs, API responses, and UI views.
+
+---
+
+## Security & Verification / セキュリティと脆弱性対策 (50/50 Tests Passing)
+
+AegisFetch v2.1.1 is built with deep-defense security guardrails audited across 50 automated tests:
+- **Direct, Open-Redirect & Proxy-based SSRF Prevention**: Inspects every redirect hop (`301`/`302`/`307`/`308`) and proxy target, blocking private IP ranges (RFC 1918), loopback (`127.0.0.1`), and cloud metadata endpoints (`169.254.169.254`).
+- **Web UI CSRF & DNS Rebinding Protection**: Strictly validates `Host` and `Origin` headers on local Web UI API endpoints (`127.0.0.1` / `localhost` only) and enforces `X-Frame-Options: DENY` & `X-Content-Type-Options: nosniff`.
 - **System Directory & Path Traversal Defense**: Blocks writes to critical OS folders (`C:\Windows`, `/etc`, Startup) and confines output paths via `os.path.commonpath`.
 - **Streamed Chunk Size Cutoff**: Streams downloads in 64KB chunks and aborts immediately if payload exceeds 100MB to prevent RAM/disk exhaustion.
+- **Zero MCP Stdio Pollution**: Directs all runtime logs strictly to `stderr` with safe CP932 fallback so MCP JSON-RPC streams remain 100% pure.
 
-Run the verification suite:
+Run the full verification suite:
 ```bash
 python test_mcp_security.py
 ```
@@ -177,7 +189,11 @@ python test_mcp_security.py
 | `--out-dir` | `./downloads` | Destination folder / 保存先フォルダ |
 | `--min-delay` | `1.0` | Minimum wait between requests (sec) / 最小待機時間(秒) |
 | `--max-delay` | `2.5` | Maximum wait between requests (sec) / 最大待機時間(秒) |
-| `--proxy` | `None` | HTTP or SOCKS5 proxy URL / プロキシ指定 |
+| `--proxy` | `None` | Single HTTP/SOCKS5 proxy URL / 単一プロキシ指定 |
+| `--proxies` | `None` | Multiple proxy URLs for per-file rotation / 複数プロキシ自動切替 |
+| `--proxy-file` | `None` | Text file containing proxy list / プロキシリストファイル |
+| `--auto-free-proxies` | `False` | Auto-harvest & test free proxies / 無料プロキシ自動取得＆利用 |
+| `--no-direct-fallback` | `False` | Disable direct fallback when proxies fail / 直接通信フォールバック無効化 |
 
 ---
 

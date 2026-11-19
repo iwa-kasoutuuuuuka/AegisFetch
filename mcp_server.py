@@ -302,16 +302,23 @@ def _run_background_job(
     is_part_numbers: bool,
     target_dir: str,
     min_delay: float,
-    max_delay: float
+    max_delay: float,
+    proxies: Optional[List[str]] = None
 ):
     """Worker thread function for non-blocking large batch downloads."""
     try:
-        fetcher = AegisFetch(output_dir=target_dir, min_delay=min_delay, max_delay=max_delay, quiet=True)
+        fetcher = AegisFetch(
+            output_dir=target_dir,
+            min_delay=min_delay,
+            max_delay=max_delay,
+            proxies=proxies,
+            quiet=True
+        )
 
         for idx, item in enumerate(items, 1):
             try:
                 if is_part_numbers and not item.lower().startswith("http"):
-                    resolved = CatalogExtractor.resolve_balluff_part(item, session=fetcher.session)
+                    resolved = CatalogExtractor.resolve_balluff_part(item, session=None)
                     res = fetcher.download_file(
                         url=resolved["url"],
                         filename=resolved["filename"],
@@ -328,6 +335,7 @@ def _run_background_job(
                     "success": res.success,
                     "skipped": res.skipped,
                     "size_kb": round(res.size_bytes / 1024, 2),
+                    "proxy_used": res.proxy_used,
                     "error": res.error_msg
                 }
             except Exception as e:
@@ -367,7 +375,8 @@ def start_batch_job(
     is_part_numbers: bool = False,
     output_dir: Optional[str] = None,
     min_delay: float = 0.8,
-    max_delay: float = 1.8
+    max_delay: float = 1.8,
+    proxies: Optional[List[str]] = None
 ) -> str:
     """
     Launch an asynchronous background batch download job.
@@ -401,7 +410,7 @@ def start_batch_job(
 
     worker = threading.Thread(
         target=_run_background_job,
-        args=(job_id, items, is_part_numbers, target_dir, max(0.4, min_delay), max(0.8, max_delay)),
+        args=(job_id, items, is_part_numbers, target_dir, max(0.4, min_delay), max(0.8, max_delay), proxies),
         daemon=True
     )
     worker.start()

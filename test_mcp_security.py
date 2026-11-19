@@ -203,7 +203,7 @@ def test_extractor_and_background_jobs():
 
 async def main():
     print("==================================================================")
-    print("   AegisFetch v2.0.1 - Full Security, Extractor & Job Test Suite")
+    print("   AegisFetch v2.1.1 - Full Security, Proxy & Web UI Test Suite")
     print("==================================================================")
     await test_mcp_registration()
     test_ssrf_and_redirect_vulnerabilities()
@@ -367,6 +367,40 @@ def test_web_ui_endpoints():
                 "Web UI POST /api/free-proxies returns proxy list",
                 fp_data.get("success") is True and len(fp_data.get("working_proxies", [])) >= 5
             )
+
+        # 7. Proxy-SSRF & Credential Masking Vulnerability Defenses
+        from proxy_manager import normalize_proxy_url, mask_proxy_credentials
+        record_test("Proxy-SSRF Block: 127.0.0.1 rejected", normalize_proxy_url("http://127.0.0.1:8080") is None)
+        record_test("Proxy-SSRF Block: 169.254.169.254 rejected", normalize_proxy_url("http://169.254.169.254:80") is None)
+        record_test("Proxy-SSRF Block: 192.168.1.1 rejected", normalize_proxy_url("http://192.168.1.1:3128") is None)
+
+        masked = mask_proxy_credentials("http://admin:SuperSecret123@203.0.113.5:8080")
+        record_test("Proxy Credential Masking hides password", "SuperSecret123" not in masked and "***:***" in masked)
+
+        # 8. Web UI CSRF Attack Defense (External Origin Header -> HTTP 403)
+        req_csrf = urllib.request.Request(
+            base_url + "/api/start",
+            data=json.dumps({"items": ["BES0002"], "output_dir": test_dir}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Origin": "https://evil-attacker.com"},
+        )
+        csrf_blocked = False
+        try:
+            urllib.request.urlopen(req_csrf)
+        except urllib.error.HTTPError as e:
+            csrf_blocked = (e.code == 403)
+        record_test("Web UI CSRF Defense blocks external Origin with HTTP 403", csrf_blocked)
+
+        # 9. Web UI DNS Rebinding Defense (External Host Header -> HTTP 403)
+        req_rebind = urllib.request.Request(
+            base_url + "/api/files",
+            headers={"Host": "evil-rebind.attacker.com:18765"},
+        )
+        rebind_blocked = False
+        try:
+            urllib.request.urlopen(req_rebind)
+        except urllib.error.HTTPError as e:
+            rebind_blocked = (e.code == 403)
+        record_test("Web UI DNS Rebinding Defense blocks external Host with HTTP 403", rebind_blocked)
 
     finally:
         ui_server.shutdown()
