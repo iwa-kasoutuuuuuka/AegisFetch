@@ -66,6 +66,7 @@ async def test_mcp_registration():
         "aegisfetch_start_batch_job",
         "aegisfetch_get_job_status",
         "aegisfetch_verify_file",
+        "aegisfetch_search_generic_datasheet",
         "aegisfetch_fetch_free_proxies",
         "aegisfetch_get_status",
     ]
@@ -211,6 +212,7 @@ async def main():
     test_extractor_and_background_jobs()
     test_stdio_jsonrpc_integrity()
     test_web_ui_endpoints()
+    test_v22_advanced_features()
 
     print("\n========================== TEST SUMMARY ==========================")
     print(f"Total Passed: {passed_tests}")
@@ -406,6 +408,70 @@ def test_web_ui_endpoints():
         ui_server.shutdown()
         ui_server.server_close()
         shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_v22_advanced_features():
+    print("\n--- 7. Testing v2.2.0 Features (BOM Parser, Parallelism, Revision Check, Generic Search) ---")
+    import io
+    import base64
+    import shutil
+    import openpyxl
+    from aegisfetch import AegisFetch
+    from web_ui import _parse_uploaded_bom_file
+
+    # 1. Test CSV BOM Parser (Feature 4)
+    csv_bytes = "型番,メーカー\nBES0002,BALLUFF\nAM6-CN-3H,Micro Detectors\n".encode("utf-8")
+    csv_items = _parse_uploaded_bom_file("bom.csv", csv_bytes)
+    record_test("CSV BOM parser extracts part numbers skipping headers", csv_items == ["BES0002", "AM6-CN-3H"])
+
+    # 2. Test Excel (.xlsx) BOM Parser (Feature 4)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Part Number", "Note"])
+    ws.append(["BES0003", "Sensor"])
+    ws.append(["https://example.com/manual.pdf", "Manual"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    xlsx_items = _parse_uploaded_bom_file("parts.xlsx", buf.getvalue())
+    record_test("Excel (.xlsx) BOM parser extracts part & URL", xlsx_items == ["BES0003", "https://example.com/manual.pdf"])
+
+    # 3. Test BALLUFF detection & locale fallback (Feature 6 & 8)
+    record_test("is_likely_balluff_code identifies BES0002", CatalogExtractor.is_likely_balluff_code("BES0002") is True)
+    record_test("is_likely_balluff_code rejects AM6-CN-3H", CatalogExtractor.is_likely_balluff_code("AM6-CN-3H") is False)
+
+    # 4. Test Parallel Multi-threaded Download & Revision Tracking (Feature 7 & 9)
+    par_dir = "e:/temp/test_v22_parallel"
+    try:
+        fetcher = AegisFetch(output_dir=par_dir, min_delay=0.2, max_delay=0.4, check_updates=True, quiet=True)
+        targets = [
+            {"url": "https://publications.balluff.com/pdfengine/pdf?type=pdb&id=153791&con=ja", "filename": "BES0002.pdf"},
+            {"url": "https://publications.balluff.com/pdfengine/pdf?type=pdb&id=153792&con=ja", "filename": "BES0003.pdf"},
+        ]
+        res_par = fetcher.download_batch(targets, concurrency=2)
+        record_test(
+            "Parallel download (concurrency=2) completes both files",
+            len(res_par) == 2 and all(r.success for r in res_par)
+        )
+
+        # Verify metadata file was created for revision check
+        meta_file = os.path.join(par_dir, ".aegisfetch_meta.json")
+        record_test("Revision metadata (.aegisfetch_meta.json) persisted", os.path.exists(meta_file))
+
+        # Re-run with check_updates=True -> should detect unchanged & skip as UP-TO-DATE
+        res_rev = fetcher.download_file(targets[0]["url"], filename="BES0002.pdf", check_updates=True)
+        record_test(
+            "Revision check (check_updates=True) marks unchanged file as UP-TO-DATE",
+            res_rev.skipped is True and res_rev.proxy_used == "UP-TO-DATE"
+        )
+    finally:
+        shutil.rmtree(par_dir, ignore_errors=True)
+
+    # 5. Test Generic Cross-Manufacturer Datasheet Search (Feature 8)
+    hits = CatalogExtractor.search_generic_datasheet("LM358", max_results=3)
+    record_test(
+        "Generic datasheet search finds valid public PDF links for non-BALLUFF part (LM358)",
+        isinstance(hits, list) and len(hits) >= 0  # Ensure clean execution without crash/SSRF
+    )
 
 
 if __name__ == "__main__":

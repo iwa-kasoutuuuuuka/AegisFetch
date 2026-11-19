@@ -303,59 +303,90 @@ def _run_background_job(
     target_dir: str,
     min_delay: float,
     max_delay: float,
-    proxies: Optional[List[str]] = None
+    proxies: Optional[List[str]] = None,
+    concurrency: int = 1,
+    check_updates: bool = False,
+    enable_generic_search: bool = True
 ):
     """Worker thread function for non-blocking large batch downloads."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     try:
         fetcher = AegisFetch(
             output_dir=target_dir,
             min_delay=min_delay,
             max_delay=max_delay,
             proxies=proxies,
+            check_updates=check_updates,
             quiet=True
         )
 
-        for idx, item in enumerate(items, 1):
+        def _do_one(item: str) -> Dict[str, Any]:
             try:
                 if is_part_numbers and not item.lower().startswith("http"):
-                    resolved = CatalogExtractor.resolve_balluff_part(item, session=None)
+                    resolved = CatalogExtractor.resolve_any_part(
+                        item,
+                        auto_fallback_locales=True,
+                        enable_generic_search=enable_generic_search,
+                        session=None
+                    )
                     res = fetcher.download_file(
                         url=resolved["url"],
                         filename=resolved["filename"],
-                        referer=resolved["referer"]
+                        referer=resolved.get("referer")
                     )
                 else:
                     safe_u = validate_url(item)
                     fname = sanitize_filename(safe_u.split("?")[0].split("/")[-1])
                     res = fetcher.download_file(url=safe_u, filename=fname)
 
-                entry = {
+                return {
                     "item": item,
                     "saved_path": res.save_path,
                     "success": res.success,
                     "skipped": res.skipped,
+                    "updated": res.updated,
                     "size_kb": round(res.size_bytes / 1024, 2),
                     "proxy_used": res.proxy_used,
                     "error": res.error_msg
                 }
             except Exception as e:
-                entry = {
+                return {
                     "item": item,
                     "saved_path": None,
                     "success": False,
                     "skipped": False,
+                    "updated": False,
                     "size_kb": 0,
                     "error": str(e)
                 }
 
-            with _JOBS_LOCK:
-                job = _BACKGROUND_JOBS[job_id]
-                job["completed_items"] = idx
-                job["results"].append(entry)
-                if entry["success"]:
-                    job["success_count"] += 1
-                else:
-                    job["failed_count"] += 1
+        workers = max(1, min(8, concurrency))
+        if workers == 1:
+            for idx, item in enumerate(items, 1):
+                entry = _do_one(item)
+                with _JOBS_LOCK:
+                    job = _BACKGROUND_JOBS[job_id]
+                    job["completed_items"] = idx
+                    job["results"].append(entry)
+                    if entry["success"]:
+                        job["success_count"] += 1
+                    else:
+                        job["failed_count"] += 1
+        else:
+            completed = 0
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_do_one, it) for it in items]
+                for fut in as_completed(futs):
+                    entry = fut.result()
+                    completed += 1
+                    with _JOBS_LOCK:
+                        job = _BACKGROUND_JOBS[job_id]
+                        job["completed_items"] = completed
+                        job["results"].append(entry)
+                        if entry["success"]:
+                            job["success_count"] += 1
+                        else:
+                            job["failed_count"] += 1
     finally:
         with _JOBS_LOCK:
             if job_id in _BACKGROUND_JOBS:
@@ -367,7 +398,7 @@ def _run_background_job(
     name="aegisfetch_start_batch_job",
     description=(
         "Start a non-blocking background job to download a large list of URLs or part numbers (up to 500 items). "
-        "Returns a job_id immediately so MCP never times out. Poll progress with 'aegisfetch_get_job_status'."
+        "Supports multi-threaded parallelism, proxy rotation, locale fallback, generic datasheet search, and update checking."
     )
 )
 def start_batch_job(
@@ -376,7 +407,10 @@ def start_batch_job(
     output_dir: Optional[str] = None,
     min_delay: float = 0.8,
     max_delay: float = 1.8,
-    proxies: Optional[List[str]] = None
+    proxies: Optional[List[str]] = None,
+    concurrency: int = 1,
+    check_updates: bool = False,
+    enable_generic_search: bool = True
 ) -> str:
     """
     Launch an asynchronous background batch download job.
@@ -410,7 +444,18 @@ def start_batch_job(
 
     worker = threading.Thread(
         target=_run_background_job,
-        args=(job_id, items, is_part_numbers, target_dir, max(0.4, min_delay), max(0.8, max_delay), proxies),
+        args=(
+            job_id,
+            items,
+            is_part_numbers,
+            target_dir,
+            max(0.4, min_delay),
+            max(0.8, max_delay),
+            proxies,
+            concurrency,
+            check_updates,
+            enable_generic_search
+        ),
         daemon=True
     )
     worker.start()
@@ -420,6 +465,8 @@ def start_batch_job(
         "job_id": job_id,
         "status": "running",
         "total_items": len(items),
+        "concurrency": max(1, min(8, concurrency)),
+        "check_updates": check_updates,
         "output_dir": target_dir,
         "message": f"Background job '{job_id}' started. Call 'aegisfetch_get_job_status' with this job_id to check progress."
     }, ensure_ascii=False, indent=2)
@@ -487,6 +534,30 @@ def verify_file(file_path: str) -> str:
         "is_valid_pdf": is_pdf,
         "is_suspicious_html": is_html
     }, ensure_ascii=False, indent=2)
+
+
+@server.tool(
+    name="aegisfetch_search_generic_datasheet",
+    description=(
+        "Search the public web for datasheet PDF URLs for ANY manufacturer part number "
+        "(e.g., Omron, Keyence, SMC, Micro Detectors, Texas Instruments). "
+        "All returned URLs are SSRF-validated."
+    )
+)
+def search_generic_datasheet(part_number: str, max_results: int = 5) -> str:
+    """
+    Search for datasheet PDFs across any manufacturer.
+    """
+    try:
+        hits = CatalogExtractor.search_generic_datasheet(part_number=part_number, max_results=min(10, max(1, max_results)))
+        return json.dumps({
+            "success": True,
+            "part_number": part_number,
+            "found_count": len(hits),
+            "candidates": hits
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False, indent=2)
 
 
 @server.tool(

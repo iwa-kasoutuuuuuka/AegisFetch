@@ -1,26 +1,33 @@
 """
-AegisFetch Web UI Dashboard (v2.1.0)
+AegisFetch Web UI Dashboard (v2.2.0)
 ====================================
-Interactive browser-based GUI for AegisFetch with Multi-Proxy Rotation & Free Proxy Harvester.
-Allows users to:
-- Paste part numbers (e.g., BALLUFF order codes) or URLs
-- Configure a list of proxies for automatic 1-request-per-IP rotation
-- Harvest & live-test free public proxies with 1 click
-- Extract PDFs from product pages & monitor real-time download progress
+Interactive browser-based GUI for AegisFetch featuring:
+- Drag & Drop Excel (.xlsx) / CSV / TXT BOM import (/api/parse-file)
+- One-Click Retry Failed Items
+- Multi-Locale Auto-Fallback (ja-jp -> en-us -> de-de)
+- Cross-Manufacturer Generic Datasheet Search (DuckDuckGo PDF Finder)
+- Multi-Threaded Parallel Downloads (1 to 8 workers) with Multi-Proxy IP Rotation
+- Catalog Revision / Update Check Mode (ETag / Last-Modified tracking)
+- Built-in Free Public Proxy Harvester & Live Tester
 
 Security:
 - Bound strictly to 127.0.0.1 by default
-- Enforces all AegisFetch SSRF, Open-Redirect, and Path Traversal guardrails
+- Host/Origin checks (CSRF & DNS Rebinding protection)
+- SSRF, Open-Redirect, and Path Traversal guardrails
 """
 
 import os
+import io
+import csv
 import sys
 import uuid
 import time
 import json
+import base64
 import threading
 import webbrowser
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote, parse_qs
@@ -45,6 +52,61 @@ _UI_JOBS_LOCK = threading.Lock()
 _UI_JOBS: Dict[str, Dict[str, Any]] = {}
 
 
+def _parse_uploaded_bom_file(filename: str, raw_bytes: bytes) -> List[str]:
+    """
+    Parse .txt, .csv, or .xlsx BOM files and extract part numbers / URLs.
+    """
+    ext = os.path.splitext(filename.lower())[1]
+    extracted: List[str] = []
+    seen = set()
+
+    def _add_token(val: str):
+        s = (val or "").strip()
+        if not s or s.startswith("#"):
+            return
+        # Skip common header labels
+        if s.lower() in ("part", "part_number", "model", "type", "url", "型式", "型番", "品番", "order_code", "name"):
+            return
+        if s not in seen:
+            seen.add(s)
+            extracted.append(s)
+
+    if ext == ".xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            for row in ws.iter_rows(values_only=True):
+                for cell in row:
+                    if cell is not None:
+                        text = str(cell).strip()
+                        if text.lower().startswith(("http://", "https://")) or (
+                            len(text) >= 4 and any(ch.isdigit() for ch in text) and any(ch.isalpha() for ch in text)
+                        ):
+                            _add_token(text)
+                            break  # Take first plausible part/URL column per row
+        finally:
+            wb.close()
+    elif ext == ".csv":
+        text = raw_bytes.decode("utf-8-sig", errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        for row in reader:
+            for cell in row:
+                c = cell.strip()
+                if c.lower().startswith(("http://", "https://")) or (
+                    len(c) >= 4 and any(ch.isdigit() for ch in c) and any(ch.isalpha() for ch in c)
+                ):
+                    _add_token(c)
+                    break
+    else:
+        # .txt or generic line-separated
+        text = raw_bytes.decode("utf-8-sig", errors="replace")
+        for line in text.splitlines():
+            _add_token(line)
+
+    return extracted
+
+
 def _run_ui_download_job(
     job_id: str,
     raw_items: List[str],
@@ -53,11 +115,15 @@ def _run_ui_download_job(
     max_delay: float,
     verify_pdf: bool,
     locale: str = "ja-jp",
+    auto_fallback_locales: bool = True,
+    enable_generic_search: bool = True,
+    check_updates: bool = False,
+    concurrency: int = 1,
     proxies: Optional[List[str]] = None,
     proxy_rotation_mode: str = "round_robin",
     fallback_to_direct: bool = True,
 ):
-    """Background worker for Web UI batch downloads with proxy rotation & cancellation support."""
+    """Background worker for Web UI batch downloads with parallelism, proxy rotation & cancellation."""
     try:
         fetcher = AegisFetch(
             output_dir=target_dir,
@@ -67,15 +133,16 @@ def _run_ui_download_job(
             proxy_rotation_mode=proxy_rotation_mode,
             fallback_to_direct=fallback_to_direct,
             verify_pdf=verify_pdf,
+            check_updates=check_updates,
             quiet=True
         )
 
-        for idx, raw_line in enumerate(raw_items, 1):
+        workers = max(1, min(8, concurrency))
+
+        def _process_one(idx: int, raw_line: str) -> Dict[str, Any]:
             with _UI_JOBS_LOCK:
                 if _UI_JOBS[job_id].get("cancel_requested"):
-                    _UI_JOBS[job_id]["status"] = "cancelled"
-                    _UI_JOBS[job_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    return
+                    return {"cancelled": True}
                 _UI_JOBS[job_id]["current_item"] = raw_line
 
             item = raw_line.strip()
@@ -87,21 +154,24 @@ def _run_ui_download_job(
                         fname += ".pdf"
                     res = fetcher.download_file(url=safe_u, filename=fname)
                     resolved_url = safe_u
+                    source_tag = "direct_url"
                 else:
-                    # Resolve Part Number (e.g. BES0002) using direct or current session
-                    resolved = CatalogExtractor.resolve_balluff_part(
+                    resolved = CatalogExtractor.resolve_any_part(
                         item,
                         locale=locale,
+                        auto_fallback_locales=auto_fallback_locales,
+                        enable_generic_search=enable_generic_search,
                         session=None
                     )
                     resolved_url = resolved["url"]
+                    source_tag = resolved.get("resolved_locale") or resolved.get("source", "resolved")
                     res = fetcher.download_file(
                         url=resolved["url"],
                         filename=resolved["filename"],
-                        referer=resolved["referer"]
+                        referer=resolved.get("referer")
                     )
 
-                entry = {
+                return {
                     "index": idx,
                     "input": item,
                     "url": resolved_url,
@@ -109,13 +179,15 @@ def _run_ui_download_job(
                     "saved_path": res.save_path,
                     "success": res.success,
                     "skipped": res.skipped,
+                    "updated": res.updated,
+                    "source": source_tag,
                     "size_kb": round(res.size_bytes / 1024, 2),
                     "proxy_used": res.proxy_used or "DIRECT",
                     "error": res.error_msg,
                     "timestamp": time.strftime("%H:%M:%S")
                 }
             except Exception as e:
-                entry = {
+                return {
                     "index": idx,
                     "input": item,
                     "url": None,
@@ -123,24 +195,55 @@ def _run_ui_download_job(
                     "saved_path": None,
                     "success": False,
                     "skipped": False,
+                    "updated": False,
+                    "source": "error",
                     "size_kb": 0,
                     "proxy_used": mask_proxy_credentials(fetcher.current_proxy),
                     "error": str(e),
                     "timestamp": time.strftime("%H:%M:%S")
                 }
 
+        def _record_entry(entry: Dict[str, Any]):
+            if entry.get("cancelled"):
+                return
             with _UI_JOBS_LOCK:
                 job = _UI_JOBS[job_id]
-                job["completed_items"] = idx
-                job["last_proxy"] = entry["proxy_used"]
+                job["completed_items"] += 1
+                job["last_proxy"] = entry.get("proxy_used")
                 job["results"].append(entry)
                 if entry["skipped"]:
                     job["skipped_count"] += 1
                     job["success_count"] += 1
                 elif entry["success"]:
+                    if entry.get("updated"):
+                        job["updated_count"] += 1
                     job["success_count"] += 1
                 else:
                     job["failed_count"] += 1
+
+        if workers == 1:
+            for idx, raw_line in enumerate(raw_items, 1):
+                with _UI_JOBS_LOCK:
+                    if _UI_JOBS[job_id].get("cancel_requested"):
+                        _UI_JOBS[job_id]["status"] = "cancelled"
+                        _UI_JOBS[job_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        return
+                entry = _process_one(idx, raw_line)
+                _record_entry(entry)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(_process_one, idx, raw_line)
+                    for idx, raw_line in enumerate(raw_items, 1)
+                ]
+                for fut in as_completed(futures):
+                    with _UI_JOBS_LOCK:
+                        if _UI_JOBS[job_id].get("cancel_requested"):
+                            _UI_JOBS[job_id]["status"] = "cancelled"
+                            _UI_JOBS[job_id]["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            return
+                    entry = fut.result()
+                    _record_entry(entry)
 
     finally:
         with _UI_JOBS_LOCK:
@@ -155,7 +258,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AegisFetch Web UI - Resilient Catalog Downloader &amp; Proxy Rotator</title>
+  <title>AegisFetch Web UI v2.2 - Resilient Catalog Downloader</title>
   <style>
     :root {
       --bg-dark: #0b0f19;
@@ -191,305 +294,146 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
     }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-    .brand img {
-      width: 42px;
-      height: 42px;
-      filter: drop-shadow(0 0 8px rgba(0, 242, 254, 0.4));
-    }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .brand img { width: 42px; height: 42px; filter: drop-shadow(0 0 8px rgba(0, 242, 254, 0.4)); }
     .brand-title h1 {
-      font-size: 1.25rem;
-      font-weight: 700;
+      font-size: 1.25rem; font-weight: 700;
       background: linear-gradient(90deg, var(--cyan), var(--blue));
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
     }
-    .brand-title p {
-      font-size: 0.78rem;
-      color: var(--text-muted);
-    }
-    .badge-group {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
+    .brand-title p { font-size: 0.78rem; color: var(--text-muted); }
+    .badge-group { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .badge {
-      font-size: 0.75rem;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: rgba(0, 242, 254, 0.1);
-      border: 1px solid rgba(0, 242, 254, 0.3);
-      color: var(--cyan);
+      font-size: 0.74rem; padding: 4px 10px; border-radius: 999px;
+      background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); color: var(--cyan);
     }
     .badge-purple {
-      background: rgba(168, 85, 247, 0.12);
-      border: 1px solid rgba(168, 85, 247, 0.4);
-      color: #d8b4fe;
+      background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); color: #d8b4fe;
     }
     .container {
-      max-width: 1280px;
-      margin: 22px auto;
-      padding: 0 20px;
-      display: grid;
-      grid-template-columns: 1.08fr 0.92fr;
-      gap: 22px;
+      max-width: 1280px; margin: 22px auto; padding: 0 20px;
+      display: grid; grid-template-columns: 1.12fr 0.88fr; gap: 22px;
     }
-    @media (max-width: 980px) {
-      .container { grid-template-columns: 1fr; }
-    }
+    @media (max-width: 980px) { .container { grid-template-columns: 1fr; } }
     .card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 20px;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.35);
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.35);
     }
-    .card-full {
-      grid-column: 1 / -1;
-    }
+    .card-full { grid-column: 1 / -1; }
     .card-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 14px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid rgba(255,255,255,0.06);
-      flex-wrap: wrap;
-      gap: 8px;
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 14px; padding-bottom: 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.06); flex-wrap: wrap; gap: 8px;
     }
-    .card-header h2 {
-      font-size: 1.02rem;
-      font-weight: 600;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    label {
-      display: block;
-      font-size: 0.81rem;
-      color: var(--text-muted);
-      margin-bottom: 5px;
-      font-weight: 500;
-    }
+    .card-header h2 { font-size: 1.02rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+    label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 5px; font-weight: 500; }
     textarea, input[type="text"], input[type="number"], select {
-      width: 100%;
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text-main);
-      padding: 9px 12px;
-      font-size: 0.85rem;
-      font-family: 'Consolas', 'Monaco', monospace;
-      transition: border-color 0.2s;
+      width: 100%; background: var(--bg-input); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text-main); padding: 9px 12px;
+      font-size: 0.84rem; font-family: 'Consolas', 'Monaco', monospace; transition: border-color 0.2s;
     }
     textarea:focus, input:focus, select:focus {
-      outline: none;
-      border-color: var(--cyan);
-      box-shadow: 0 0 0 2px rgba(0, 242, 254, 0.15);
+      outline: none; border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(0, 242, 254, 0.15);
     }
-    textarea {
-      min-height: 145px;
-      resize: vertical;
-      line-height: 1.45;
+    textarea { min-height: 135px; resize: vertical; line-height: 1.45; }
+    .drop-zone {
+      border: 1.5px dashed rgba(0, 242, 254, 0.35);
+      border-radius: 10px;
+      padding: 8px;
+      transition: all 0.2s;
+      background: rgba(0, 242, 254, 0.02);
+    }
+    .drop-zone.drag-over {
+      border-color: var(--cyan);
+      background: rgba(0, 242, 254, 0.1);
+      box-shadow: 0 0 15px rgba(0, 242, 254, 0.2);
+    }
+    .drop-hint {
+      font-size: 0.74rem; color: var(--text-muted); margin-top: 5px;
+      display: flex; justify-content: space-between; align-items: center;
     }
     .proxy-section {
-      margin-top: 16px;
-      padding: 14px;
-      background: rgba(14, 20, 36, 0.65);
-      border: 1px solid rgba(168, 85, 247, 0.3);
-      border-radius: 10px;
+      margin-top: 14px; padding: 12px; background: rgba(14, 20, 36, 0.65);
+      border: 1px solid rgba(168, 85, 247, 0.3); border-radius: 10px;
     }
     .proxy-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 8px;
-      flex-wrap: wrap;
-      gap: 8px;
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 8px; flex-wrap: wrap; gap: 6px;
     }
-    .proxy-header h3 {
-      font-size: 0.9rem;
-      color: #e9d5ff;
-      display: flex;
-      align-items: center;
-      gap: 6px;
+    .proxy-header h3 { font-size: 0.88rem; color: #e9d5ff; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+    .options-box {
+      margin-top: 12px; padding: 10px 12px; background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.06); border-radius: 8px;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
     }
-    .form-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-top: 12px;
+    .checkbox-row {
+      display: flex; align-items: center; gap: 7px; font-size: 0.79rem;
+      color: var(--text-main); cursor: pointer;
     }
-    .btn-row {
-      display: flex;
-      gap: 10px;
-      margin-top: 16px;
-      flex-wrap: wrap;
-    }
+    .checkbox-row input { width: auto; }
+    .btn-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
     button {
-      cursor: pointer;
-      border: none;
-      border-radius: 8px;
-      padding: 9px 16px;
-      font-size: 0.85rem;
-      font-weight: 600;
-      transition: all 0.2s;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
+      cursor: pointer; border: none; border-radius: 8px; padding: 9px 15px;
+      font-size: 0.84rem; font-weight: 600; transition: all 0.2s;
+      display: inline-flex; align-items: center; gap: 6px;
     }
     .btn-primary {
       background: linear-gradient(135deg, var(--cyan), var(--blue));
-      color: #06101e;
-      box-shadow: 0 4px 14px rgba(0, 242, 254, 0.25);
+      color: #06101e; box-shadow: 0 4px 14px rgba(0, 242, 254, 0.25);
     }
-    .btn-primary:hover:not(:disabled) {
-      transform: translateY(-1px);
-      box-shadow: 0 6px 20px rgba(0, 242, 254, 0.4);
+    .btn-primary:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(0, 242, 254, 0.4); }
+    .btn-amber {
+      background: rgba(245, 158, 11, 0.18); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.45);
     }
+    .btn-amber:hover:not(:disabled) { background: rgba(245, 158, 11, 0.3); }
     .btn-purple {
-      background: linear-gradient(135deg, #9333ea, #6366f1);
-      color: #ffffff;
-      padding: 5px 11px;
-      font-size: 0.76rem;
-    }
-    .btn-purple:hover:not(:disabled) {
-      filter: brightness(1.15);
+      background: linear-gradient(135deg, #9333ea, #6366f1); color: #fff; padding: 5px 10px; font-size: 0.75rem;
     }
     .btn-secondary {
-      background: #1e293b;
-      color: var(--text-main);
-      border: 1px solid var(--border);
+      background: #1e293b; color: var(--text-main); border: 1px solid var(--border);
     }
-    .btn-secondary:hover:not(:disabled) {
-      background: #283548;
-      border-color: var(--blue);
-    }
+    .btn-secondary:hover:not(:disabled) { background: #283548; border-color: var(--blue); }
     .btn-danger {
-      background: rgba(239, 68, 68, 0.15);
-      color: #fca5a5;
-      border: 1px solid rgba(239, 68, 68, 0.4);
+      background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4);
     }
-    .btn-danger:hover:not(:disabled) {
-      background: rgba(239, 68, 68, 0.3);
-    }
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
     .progress-box {
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-      margin-bottom: 14px;
+      background: var(--bg-input); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px;
     }
-    .progress-bar-bg {
-      width: 100%;
-      height: 12px;
-      background: #1e293b;
-      border-radius: 999px;
-      overflow: hidden;
-      margin: 10px 0;
-    }
+    .progress-bar-bg { width: 100%; height: 12px; background: #1e293b; border-radius: 999px; overflow: hidden; margin: 10px 0; }
     .progress-bar-fill {
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, var(--cyan), var(--green));
-      transition: width 0.3s ease;
+      height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--green)); transition: width 0.3s ease;
     }
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 10px;
-      margin-top: 12px;
-    }
+    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
     .stat-card {
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 8px;
-      padding: 10px;
-      text-align: center;
+      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 8px; padding: 9px; text-align: center;
     }
-    .stat-card .num {
-      font-size: 1.3rem;
-      font-weight: 700;
-    }
-    .stat-card .lbl {
-      font-size: 0.72rem;
-      color: var(--text-muted);
-      margin-top: 2px;
-    }
+    .stat-card .num { font-size: 1.25rem; font-weight: 700; }
+    .stat-card .lbl { font-size: 0.7rem; color: var(--text-muted); margin-top: 2px; }
     .log-list {
-      max-height: 410px;
-      overflow-y: auto;
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 10px;
-      font-family: 'Consolas', monospace;
-      font-size: 0.79rem;
+      max-height: 460px; overflow-y: auto; background: var(--bg-input);
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+      font-family: 'Consolas', monospace; font-size: 0.78rem;
     }
     .log-item {
-      padding: 6px 8px;
-      border-bottom: 1px solid rgba(255,255,255,0.04);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 10px;
+      padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04);
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
     }
     .log-item:last-child { border-bottom: none; }
-    .tag {
-      padding: 2px 7px;
-      border-radius: 4px;
-      font-size: 0.71rem;
-      font-weight: 700;
-      white-space: nowrap;
-    }
+    .tag { padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; white-space: nowrap; }
     .tag-ok { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .tag-upd { background: rgba(0, 242, 254, 0.2); color: #00f2fe; }
     .tag-skip { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
     .tag-fail { background: rgba(239, 68, 68, 0.2); color: #f87171; }
     .tag-proxy { background: rgba(168, 85, 247, 0.2); color: #d8b4fe; margin-right: 4px; }
-    .file-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.85rem;
-    }
-    .file-table th, .file-table td {
-      padding: 10px 12px;
-      text-align: left;
-      border-bottom: 1px solid rgba(255,255,255,0.06);
-    }
-    .file-table th {
-      color: var(--text-muted);
-      font-weight: 600;
-      font-size: 0.78rem;
-    }
-    .file-link {
-      color: var(--cyan);
-      text-decoration: none;
-      font-weight: 500;
-    }
+    .file-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    .file-table th, .file-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    .file-table th { color: var(--text-muted); font-weight: 600; font-size: 0.78rem; }
+    .file-link { color: var(--cyan); text-decoration: none; font-weight: 500; }
     .file-link:hover { text-decoration: underline; }
-    .extractor-box {
-      display: flex;
-      gap: 8px;
-      margin-top: 6px;
-    }
-    .checkbox-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-top: 8px;
-      font-size: 0.8rem;
-      color: var(--text-main);
-    }
-    .checkbox-row input { width: auto; }
+    .extractor-box { display: flex; gap: 8px; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -498,27 +442,37 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <div class="brand">
     <img src="/assets/icon.svg" alt="AegisFetch" />
     <div class="brand-title">
-      <h1>AegisFetch Web Console v2.1</h1>
-      <p>Anti-403 WAF-Evading Catalog Downloader &amp; Multi-Proxy IP Rotator</p>
+      <h1>AegisFetch Web Console v2.2</h1>
+      <p>Anti-403 WAF-Evading Catalog Downloader, BOM Importer &amp; Multi-Proxy IP Rotator</p>
     </div>
   </div>
   <div class="badge-group">
-    <span class="badge">TLS Fingerprint: Chrome124 / Safari</span>
-    <span class="badge badge-purple" id="headerProxyBadge">Proxy Rotation: Ready</span>
-    <span class="badge">SSRF Guard: ACTIVE</span>
+    <span class="badge">TLS: Chrome124 / Safari</span>
+    <span class="badge badge-purple" id="headerProxyBadge">Proxy: DIRECT</span>
+    <span class="badge">SSRF &amp; CSRF Guard: ACTIVE</span>
   </div>
 </header>
 
 <div class="container">
-  <!-- Left Card: Input, Proxy Rotation & Controls -->
+  <!-- Left Card -->
   <div class="card">
     <div class="card-header">
       <h2>📥 カタログ一括ダウンロード設定</h2>
-      <button class="btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="loadSampleList()">サンプル型番を挿入</button>
+      <div style="display:flex; gap:6px;">
+        <input type="file" id="bomFileInput" accept=".txt,.csv,.xlsx" style="display:none;" onchange="handleBomFileSelect(this.files[0])" />
+        <button class="btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="document.getElementById('bomFileInput').click()">📄 Excel/CSV読込</button>
+        <button class="btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="loadSampleList()">サンプル挿入</button>
+      </div>
     </div>
 
-    <label for="itemsInput">型番リスト（例: BES0002）または PDFのURL を1行ずつ入力:</label>
-    <textarea id="itemsInput" placeholder="BES0002(BES G06EB-NOC40F-S49G)&#10;BES0003(BES G06EB-NSC40F-S49G)&#10;https://example.com/datasheet.pdf"></textarea>
+    <label for="itemsInput">型番リスト（BALLUFF / 他社メーカー型番）または URL を1行ずつ入力:</label>
+    <div class="drop-zone" id="dropZone">
+      <textarea id="itemsInput" placeholder="ここに型番・URLを入力、または Excel (.xlsx) / CSV / TXT ファイルをドラッグ＆ドロップ！&#10;&#10;例:&#10;BES0002(BES G06EB-NOC40F-S49G)&#10;AM6-CN-3H&#10;https://example.com/datasheet.pdf"></textarea>
+      <div class="drop-hint">
+        <span>💡 Excel (.xlsx) / CSV / TXT のドラッグ＆ドロップに対応</span>
+        <span id="itemCountLabel">0 件</span>
+      </div>
+    </div>
 
     <div style="margin-top: 12px;">
       <label for="extractUrlInput">🔍 WebページからPDFリンクを自動抽出して上のリストに追加:</label>
@@ -532,34 +486,24 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <div class="proxy-section">
       <div class="proxy-header">
         <h3>🌐 プロキシ自動ローテーション (1件ごとに別IPへ切替)</h3>
-        <div style="display:flex; gap:6px;">
-          <button class="btn-purple" id="btnHarvestProxies" onclick="harvestFreeProxies(true)">
-            ⚡ 無料プロキシを自動取得＆生存テスト
-          </button>
-          <button class="btn-secondary" style="padding:5px 9px; font-size:0.74rem;" onclick="loadPresetProxies()">
-            📋 プリセット挿入
-          </button>
-          <button class="btn-secondary" style="padding:5px 9px; font-size:0.74rem;" onclick="clearProxies()">
-            クリア
-          </button>
+        <div style="display:flex; gap:5px;">
+          <button class="btn-purple" id="btnHarvestProxies" onclick="harvestFreeProxies(true)">⚡ 無料プロキシ取得＆テスト</button>
+          <button class="btn-secondary" style="padding:4px 8px; font-size:0.73rem;" onclick="loadPresetProxies()">📋 プリセット</button>
+          <button class="btn-secondary" style="padding:4px 8px; font-size:0.73rem;" onclick="clearProxies()">クリア</button>
         </div>
       </div>
-
-      <label for="proxiesInput">プロキシリスト (1行に1つ `http://IP:PORT` または `socks5://IP:PORT` / 空欄なら直接通信):</label>
-      <textarea id="proxiesInput" style="min-height: 95px; font-size:0.8rem;" placeholder="http://176.111.37.5:39811&#10;http://91.134.141.4:3128&#10;socks5://208.102.51.6:58208" oninput="updateProxyCountBadge()"></textarea>
-
-      <div class="form-grid" style="margin-top:8px;">
+      <textarea id="proxiesInput" style="min-height: 75px; font-size:0.78rem;" placeholder="http://176.111.37.5:39811&#10;socks5://208.102.51.6:58208 (空欄なら直接通信)" oninput="updateProxyCountBadge()"></textarea>
+      <div class="form-grid" style="margin-top:6px;">
         <div>
-          <label for="proxyModeSelect">IPローテーション順序:</label>
-          <select id="proxyModeSelect">
-            <option value="round_robin" selected>順番に切り替え (Round-Robin: 1件ごとに次へ)</option>
-            <option value="random">ランダムに切り替え (Random)</option>
+          <select id="proxyModeSelect" style="padding:6px 10px; font-size:0.78rem;">
+            <option value="round_robin" selected>順番に切替 (Round-Robin)</option>
+            <option value="random">ランダム切替 (Random)</option>
           </select>
         </div>
-        <div style="display:flex; align-items:flex-end;">
-          <label class="checkbox-row" style="margin-bottom:6px; cursor:pointer;">
+        <div style="display:flex; align-items:center;">
+          <label class="checkbox-row" style="margin:0;">
             <input type="checkbox" id="fallbackDirectCheck" checked />
-            <span>プロキシ不通時は直接通信(Direct)で救済する</span>
+            <span>不通時は直接通信(Direct)で救済</span>
           </label>
         </div>
       </div>
@@ -571,37 +515,59 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <input type="text" id="outputDir" value="__DEFAULT_DIR__" />
       </div>
       <div>
-        <label for="localeSelect">BALLUFF 言語・地域設定:</label>
+        <label for="concurrencySelect">並列ダウンロード数 (⑦ 並列高速化):</label>
+        <select id="concurrencySelect">
+          <option value="1" selected>1 並列 (直列・最も安全)</option>
+          <option value="2">2 並列 (高速)</option>
+          <option value="3">3 並列 (プロキシ併用推奨)</option>
+          <option value="5">5 並列 (爆速・複数プロキシ向け)</option>
+        </select>
+      </div>
+      <div>
+        <label for="localeSelect">BALLUFF 優先言語:</label>
         <select id="localeSelect">
           <option value="ja-jp" selected>日本語 (ja-jp)</option>
           <option value="en-us">English (en-us)</option>
           <option value="de-de">Deutsch (de-de)</option>
         </select>
       </div>
-      <div>
-        <label for="minDelay">最小待機 ジッター (秒):</label>
-        <input type="number" id="minDelay" value="0.8" step="0.2" min="0.2" />
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+        <div>
+          <label for="minDelay">最小待機(秒):</label>
+          <input type="number" id="minDelay" value="0.6" step="0.2" min="0.2" />
+        </div>
+        <div>
+          <label for="maxDelay">最大待機(秒):</label>
+          <input type="number" id="maxDelay" value="1.5" step="0.2" min="0.4" />
+        </div>
       </div>
-      <div>
-        <label for="maxDelay">最大待機 ジッター (秒):</label>
-        <input type="number" id="maxDelay" value="1.8" step="0.2" min="0.5" />
-      </div>
+    </div>
+
+    <!-- Advanced Feature Toggles (6, 8, 9) -->
+    <div class="options-box">
+      <label class="checkbox-row">
+        <input type="checkbox" id="autoLocaleFallbackCheck" checked />
+        <span>⑥ 英語/独語 自動フォールバック</span>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="genericSearchCheck" checked />
+        <span>⑧ 他社型番もWeb自動検索 (PDF探索)</span>
+      </label>
+      <label class="checkbox-row" style="grid-column: 1 / -1;">
+        <input type="checkbox" id="checkUpdatesCheck" />
+        <span>⑨ カタログ改訂・更新チェック (既存ファイルの最新版をサーバー確認)</span>
+      </label>
     </div>
 
     <div class="btn-row">
-      <button class="btn-primary" id="btnStart" onclick="startDownloadJob()">
-        🚀 ダウンロード開始
-      </button>
-      <button class="btn-danger" id="btnCancel" onclick="cancelCurrentJob()" disabled>
-        ⏹ 停止
-      </button>
-      <button class="btn-secondary" onclick="openOutputFolder()">
-        📂 保存先フォルダを開く
-      </button>
+      <button class="btn-primary" id="btnStart" onclick="startDownloadJob()">🚀 ダウンロード開始</button>
+      <button class="btn-amber" id="btnRetryFailed" onclick="retryFailedItems()" disabled>🔄 失敗分のみ再試行</button>
+      <button class="btn-danger" id="btnCancel" onclick="cancelCurrentJob()" disabled>⏹ 停止</button>
+      <button class="btn-secondary" onclick="openOutputFolder()">📂 フォルダを開く</button>
     </div>
   </div>
 
-  <!-- Right Card: Live Progress & Logs -->
+  <!-- Right Card -->
   <div class="card">
     <div class="card-header">
       <h2>📊 リアルタイム実行ステータス</h2>
@@ -616,7 +582,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <div class="progress-bar-bg">
         <div class="progress-bar-fill" id="progressBar"></div>
       </div>
-      <div style="font-size:0.76rem; color:#d8b4fe; margin-top:4px;" id="activeProxyText">
+      <div style="font-size:0.75rem; color:#d8b4fe; margin-top:4px;" id="activeProxyText">
         現在の通信経路: DIRECT (標準回線)
       </div>
 
@@ -627,7 +593,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
         <div class="stat-card">
           <div class="num" id="statSuccess" style="color:var(--green);">0</div>
-          <div class="lbl">成功 (OK)</div>
+          <div class="lbl">成功 / 更新</div>
         </div>
         <div class="stat-card">
           <div class="num" id="statSkipped" style="color:var(--amber);">0</div>
@@ -640,21 +606,21 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
     </div>
 
-    <label>実行ログ (1件ごとの使用プロキシIP ＆ 結果):</label>
+    <label>実行ログ (1件ごとの通信経路 / 言語・検索ソース / 結果):</label>
     <div class="log-list" id="logList">
       <div style="color:var(--text-muted); text-align:center; padding: 30px 0;">
-        左側のフォームに型番またはURLを入力して「ダウンロード開始」を押してください。
+        左側のフォームに型番・URLを入力、または Excel/CSV をドロップしてください。
       </div>
     </div>
   </div>
 
-  <!-- Bottom Full Card: Downloaded Files -->
+  <!-- Bottom Card -->
   <div class="card card-full">
     <div class="card-header">
       <h2>📁 ダウンロード済みカタログ一覧 (<span id="fileCountLabel">0</span> ファイル)</h2>
       <button class="btn-secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshFileList()">🔄 一覧を更新</button>
     </div>
-    <div style="max-height: 340px; overflow-y: auto;">
+    <div style="max-height: 320px; overflow-y: auto;">
       <table class="file-table">
         <thead>
           <tr>
@@ -673,14 +639,70 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 <script>
   let activeJobId = null;
   let pollTimer = null;
+  let lastFailedItems = [];
+
+  function updateItemCount() {
+    const raw = document.getElementById('itemsInput').value;
+    const count = raw.split(/\\r?\\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#')).length;
+    document.getElementById('itemCountLabel').textContent = count + ' 件';
+  }
+  document.getElementById('itemsInput').addEventListener('input', updateItemCount);
+
+  // Drag & Drop BOM Handler
+  const dropZone = document.getElementById('dropZone');
+  dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('drag-over');
+  });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleBomFileSelect(e.dataTransfer.files[0]);
+    }
+  });
+
+  async function handleBomFileSelect(file) {
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      alert("ファイルサイズが大きすぎます (上限 5MB)");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const b64 = reader.result.split(',')[1];
+      try {
+        const resp = await fetch('/api/parse-file', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({filename: file.name, content_b64: b64})
+        });
+        const data = await resp.json();
+        if (!data.success) {
+          alert("ファイル解析エラー: " + data.message);
+          return;
+        }
+        const ta = document.getElementById('itemsInput');
+        const existing = ta.value.trim();
+        const loaded = (data.items || []).join("\\n");
+        ta.value = existing ? (existing + "\\n" + loaded) : loaded;
+        updateItemCount();
+        alert(`「${file.name}」から ${data.items.length} 件の型番/URLを読み込みました！`);
+      } catch (e) {
+        alert("通信エラー: " + e);
+      }
+    };
+    reader.readAsDataURL(file);
+  }
 
   function loadSampleList() {
     document.getElementById('itemsInput').value = [
       "BES0002(BES G06EB-NOC40F-S49G)",
       "BES0003(BES G06EB-NSC40F-S49G)",
-      "BES0004(BES G06EB-POC40F-S49G)",
-      "BES0005(BES G06EB-PSC40F-S49G)"
+      "AM6-CN-3H"
     ].join("\\n");
+    updateItemCount();
   }
 
   function getConfiguredProxies() {
@@ -691,17 +713,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   function updateProxyCountBadge() {
     const list = getConfiguredProxies();
     const badge = document.getElementById('headerProxyBadge');
-    if (list.length > 0) {
-      badge.textContent = `Proxy Rotation: ACTIVE (${list.length} IPs)`;
-    } else {
-      badge.textContent = 'Proxy Rotation: DIRECT';
-    }
+    badge.textContent = list.length > 0 ? `Proxy: ACTIVE (${list.length} IPs)` : 'Proxy: DIRECT';
   }
 
   async function harvestFreeProxies(verifyLive) {
     const btn = document.getElementById('btnHarvestProxies');
     btn.disabled = true;
-    btn.textContent = "⏳ 公開プロキシ収集＆生存テスト中(約4秒)...";
+    btn.textContent = "⏳ 収集＆生存テスト中(約4秒)...";
     try {
       const resp = await fetch('/api/free-proxies', {
         method: 'POST',
@@ -713,15 +731,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         alert("無料プロキシ取得エラー: " + (data.message || ""));
         return;
       }
-      const ta = document.getElementById('proxiesInput');
-      ta.value = (data.working_proxies || []).join("\\n");
+      document.getElementById('proxiesInput').value = (data.working_proxies || []).join("\\n");
       updateProxyCountBadge();
-      alert(`公開リスト(${data.fetched_total}件)から高速に応答する無料プロキシ ${data.working_proxies.length} 件を抽出し、セットしました！`);
+      alert(`公開リスト(${data.fetched_total}件)から高速応答プロキシ ${data.working_proxies.length} 件をセットしました！`);
     } catch (e) {
       alert("通信エラー: " + e);
     } finally {
       btn.disabled = false;
-      btn.textContent = "⚡ 無料プロキシを自動取得＆生存テスト";
+      btn.textContent = "⚡ 無料プロキシ取得＆テスト";
     }
   }
 
@@ -746,10 +763,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   async function extractLinksFromPage() {
     const urlInput = document.getElementById('extractUrlInput');
     const url = urlInput.value.trim();
-    if (!url) {
-      alert("抽出元のWebページURLを入力してください。");
-      return;
-    }
+    if (!url) { alert("抽出元のWebページURLを入力してください。"); return; }
     const btn = document.getElementById('btnExtract');
     btn.disabled = true;
     btn.textContent = "解析中...";
@@ -760,20 +774,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         body: JSON.stringify({url})
       });
       const data = await resp.json();
-      if (!data.success) {
-        alert("抽出エラー: " + (data.message || "不明なエラー"));
-        return;
-      }
-      if (data.pdf_links.length === 0) {
-        alert("このページからはPDFリンクが見つかりませんでした。");
-        return;
-      }
+      if (!data.success) { alert("抽出エラー: " + (data.message || "")); return; }
+      if (data.pdf_links.length === 0) { alert("PDFリンクが見つかりませんでした。"); return; }
       const ta = document.getElementById('itemsInput');
       const existing = ta.value.trim();
       const newUrls = data.pdf_links.map(x => x.url).join("\\n");
       ta.value = existing ? (existing + "\\n" + newUrls) : newUrls;
+      updateItemCount();
       urlInput.value = "";
-      alert(data.pdf_links.length + " 件のPDFリンクを抽出し、リストに追加しました！");
+      alert(data.pdf_links.length + " 件のPDFリンクを追加しました！");
     } catch (e) {
       alert("通信エラー: " + e);
     } finally {
@@ -782,37 +791,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
   }
 
-  async function startDownloadJob() {
-    const rawText = document.getElementById('itemsInput').value;
-    const items = rawText.split(/\\r?\\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
-    if (items.length === 0) {
-      alert("型番またはURLを1件以上入力してください。");
-      return;
-    }
+  async function launchJobWithItems(items) {
     const proxies = getConfiguredProxies();
     const proxy_rotation_mode = document.getElementById('proxyModeSelect').value;
     const fallback_to_direct = document.getElementById('fallbackDirectCheck').checked;
     const output_dir = document.getElementById('outputDir').value.trim();
     const locale = document.getElementById('localeSelect').value;
-    const min_delay = parseFloat(document.getElementById('minDelay').value) || 0.8;
-    const max_delay = parseFloat(document.getElementById('maxDelay').value) || 1.8;
+    const concurrency = parseInt(document.getElementById('concurrencySelect').value, 10) || 1;
+    const auto_fallback_locales = document.getElementById('autoLocaleFallbackCheck').checked;
+    const enable_generic_search = document.getElementById('genericSearchCheck').checked;
+    const check_updates = document.getElementById('checkUpdatesCheck').checked;
+    const min_delay = parseFloat(document.getElementById('minDelay').value) || 0.6;
+    const max_delay = parseFloat(document.getElementById('maxDelay').value) || 1.5;
 
     document.getElementById('btnStart').disabled = true;
+    document.getElementById('btnRetryFailed').disabled = true;
     document.getElementById('btnCancel').disabled = false;
+    lastFailedItems = [];
 
     try {
       const resp = await fetch('/api/start', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-          items,
-          proxies,
-          proxy_rotation_mode,
-          fallback_to_direct,
-          output_dir,
-          locale,
-          min_delay,
-          max_delay
+          items, proxies, proxy_rotation_mode, fallback_to_direct,
+          output_dir, locale, concurrency, auto_fallback_locales,
+          enable_generic_search, check_updates, min_delay, max_delay
         })
       });
       const data = await resp.json();
@@ -825,12 +829,26 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       activeJobId = data.job_id;
       if (pollTimer) clearInterval(pollTimer);
       pollJobStatus();
-      pollTimer = setInterval(pollJobStatus, 800);
+      pollTimer = setInterval(pollJobStatus, 700);
     } catch (e) {
       alert("リクエスト失敗: " + e);
       document.getElementById('btnStart').disabled = false;
       document.getElementById('btnCancel').disabled = true;
     }
+  }
+
+  function startDownloadJob() {
+    const rawText = document.getElementById('itemsInput').value;
+    const items = rawText.split(/\\r?\\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+    if (items.length === 0) { alert("型番またはURLを1件以上入力してください。"); return; }
+    launchJobWithItems(items);
+  }
+
+  function retryFailedItems() {
+    if (lastFailedItems.length === 0) return;
+    document.getElementById('itemsInput').value = lastFailedItems.join("\\n");
+    updateItemCount();
+    launchJobWithItems(lastFailedItems);
   }
 
   async function cancelCurrentJob() {
@@ -863,17 +881,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById('activeProxyText').textContent = `直近の通信経路 (IP): ${job.last_proxy}`;
       }
 
+      const results = job.results || [];
+      renderLogs(results);
+
       if (job.status === 'running') {
         document.getElementById('currentItemText').textContent = "処理中: " + (job.current_item || "...");
       } else {
         document.getElementById('currentItemText').textContent = `完了 (${job.status})`;
         document.getElementById('btnStart').disabled = false;
         document.getElementById('btnCancel').disabled = true;
+        lastFailedItems = results.filter(r => !r.success).map(r => r.input);
+        document.getElementById('btnRetryFailed').disabled = (lastFailedItems.length === 0);
         clearInterval(pollTimer);
         refreshFileList();
       }
-
-      renderLogs(job.results || []);
     } catch (e) {
       console.error(e);
     }
@@ -891,13 +912,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       left.style.overflow = 'hidden';
       left.style.textOverflow = 'ellipsis';
       left.style.whiteSpace = 'nowrap';
-      left.textContent = `[#${r.index}] ${r.input} -> ${r.filename || r.error || ''}`;
+      const srcLabel = r.source && r.source !== 'direct_url' ? ` (${r.source})` : '';
+      left.textContent = `[#${r.index}] ${r.input}${srcLabel} -> ${r.filename || r.error || ''}`;
 
       const rightWrap = document.createElement('div');
       rightWrap.style.display = 'flex';
       rightWrap.style.alignItems = 'center';
 
-      if (r.proxy_used && r.proxy_used !== 'SKIPPED') {
+      if (r.proxy_used && r.proxy_used !== 'SKIPPED' && r.proxy_used !== 'UP-TO-DATE') {
         const pTag = document.createElement('span');
         pTag.className = 'tag tag-proxy';
         pTag.textContent = r.proxy_used;
@@ -907,7 +929,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const right = document.createElement('span');
       if (r.skipped) {
         right.className = 'tag tag-skip';
-        right.textContent = `SKIP (${r.size_kb} KB)`;
+        right.textContent = r.proxy_used === 'UP-TO-DATE' ? `最新(SKIP)` : `SKIP (${r.size_kb} KB)`;
+      } else if (r.updated) {
+        right.className = 'tag tag-upd';
+        right.textContent = `UPDATED (${r.size_kb} KB)`;
       } else if (r.success) {
         right.className = 'tag tag-ok';
         right.textContent = `OK (${r.size_kb} KB)`;
@@ -935,7 +960,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.getElementById('fileCountLabel').textContent = data.files.length;
       for (const f of data.files) {
         const tr = document.createElement('tr');
-
         const tdName = document.createElement('td');
         const a = document.createElement('a');
         a.className = 'file-link';
@@ -979,6 +1003,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   window.addEventListener('DOMContentLoaded', () => {
     refreshFileList();
     updateProxyCountBadge();
+    updateItemCount();
   });
 </script>
 </body>
@@ -993,9 +1018,6 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         pass
 
     def _is_safe_local_request(self, is_post: bool = False) -> bool:
-        """
-        Verify Host and Origin headers to defend against DNS Rebinding and Cross-Site Request Forgery (CSRF).
-        """
         host = (self.headers.get("Host") or "").lower().strip()
         host_only = host.split(":")[0]
         if host_only not in ("127.0.0.1", "localhost", "[::1]", ""):
@@ -1022,7 +1044,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
 
     def _read_json_body(self) -> Dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > 5 * 1024 * 1024:
+        if length <= 0 or length > 8 * 1024 * 1024:
             return {}
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
@@ -1079,11 +1101,12 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     "completed_items": job["completed_items"],
                     "success_count": job["success_count"],
                     "skipped_count": job["skipped_count"],
+                    "updated_count": job.get("updated_count", 0),
                     "failed_count": job["failed_count"],
                     "current_item": job.get("current_item"),
                     "last_proxy": job.get("last_proxy"),
                     "percent": pct,
-                    "results": job["results"][-100:]
+                    "results": job["results"][-200:]
                 })
             return
 
@@ -1147,6 +1170,23 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"success": False, "message": f"Invalid JSON: {e}"}, 400)
             return
 
+        if path == "/api/parse-file":
+            filename = body.get("filename", "")
+            content_b64 = body.get("content_b64", "")
+            if not filename or not content_b64:
+                self._send_json({"success": False, "message": "Missing file data"}, 400)
+                return
+            try:
+                raw_bytes = base64.b64decode(content_b64)
+                if len(raw_bytes) > 5 * 1024 * 1024:
+                    self._send_json({"success": False, "message": "File exceeds 5MB limit"}, 400)
+                    return
+                items = _parse_uploaded_bom_file(filename, raw_bytes)
+                self._send_json({"success": True, "count": len(items), "items": items})
+            except Exception as e:
+                self._send_json({"success": False, "message": str(e)}, 400)
+            return
+
         if path == "/api/free-proxies":
             if body.get("preset_only"):
                 self._send_json({
@@ -1180,8 +1220,12 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             fallback_to_direct = bool(body.get("fallback_to_direct", True))
             req_dir = body.get("output_dir") or DEFAULT_DOWNLOAD_DIR
             locale = body.get("locale", "ja-jp")
-            min_delay = max(0.2, float(body.get("min_delay", 0.8)))
-            max_delay = max(min_delay + 0.2, float(body.get("max_delay", 1.8)))
+            auto_fallback_locales = bool(body.get("auto_fallback_locales", True))
+            enable_generic_search = bool(body.get("enable_generic_search", True))
+            check_updates = bool(body.get("check_updates", False))
+            concurrency = max(1, min(8, int(body.get("concurrency", 1))))
+            min_delay = max(0.2, float(body.get("min_delay", 0.6)))
+            max_delay = max(min_delay + 0.2, float(body.get("max_delay", 1.5)))
 
             try:
                 target_dir = validate_output_directory(req_dir)
@@ -1199,6 +1243,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     "completed_items": 0,
                     "success_count": 0,
                     "skipped_count": 0,
+                    "updated_count": 0,
                     "failed_count": 0,
                     "current_item": None,
                     "last_proxy": None,
@@ -1219,6 +1264,10 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     max_delay,
                     True,
                     locale,
+                    auto_fallback_locales,
+                    enable_generic_search,
+                    check_updates,
+                    concurrency,
                     proxies,
                     proxy_rotation_mode,
                     fallback_to_direct,
