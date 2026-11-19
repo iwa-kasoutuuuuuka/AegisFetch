@@ -89,6 +89,19 @@ def test_ssrf_and_redirect_vulnerabilities():
         ("http://192.168.1.1/router_config", "Private LAN RFC1918 Class C"),
         ("http://10.0.0.5/internal_db", "Private LAN RFC1918 Class A"),
         ("http://172.16.0.1/vault", "Private LAN RFC1918 Class B"),
+        ("http://[::ffff:127.0.0.1]/secret", "IPv6 IPv4-mapped loopback"),
+        ("http://[::ffff:169.254.169.254]/latest/meta-data/", "IPv6 IPv4-mapped metadata"),
+        ("http://[0:0:0:0:0:ffff:7f00:1]/secret", "IPv6 expanded IPv4-mapped loopback"),
+        ("http://[fe80::1%25lo0]/secret", "Scoped IPv6 zone-index link-local"),
+        ("http://2130706433/secret", "Decimal integer loopback IP"),
+        ("http://0x7f000001/secret", "Hexadecimal loopback IP"),
+        ("http://0177.0.0.1/secret", "Octal loopback IP"),
+        ("http://127.1/secret", "Shorthand IPv4 loopback"),
+        ("http://0/secret", "Zero unspecified IPv4"),
+        ("http://localhost./secret", "Trailing-dot localhost"),
+        ("http://sub.localhost/secret", "Subdomain .localhost"),
+        ("https://example.com/\r\nX-Evil: 1", "CRLF header injection in URL"),
+        ("http://example.com\\@127.0.0.1/secret", "Backslash authority confusion"),
         ("file:///C:/Windows/System32/drivers/etc/hosts", "Local file scheme"),
         ("gopher://127.0.0.1:6379/_flushall", "Gopher scheme injection"),
     ]
@@ -213,7 +226,7 @@ def test_extractor_and_background_jobs():
 
 async def main():
     print("==================================================================")
-    print("   AegisFetch v2.4.0 - Full Security, Proxy & Web UI Test Suite")
+    print("   AegisFetch v2.4.1 - Full Security, Proxy & Web UI Test Suite")
     print("==================================================================")
     await test_mcp_registration()
     test_ssrf_and_redirect_vulnerabilities()
@@ -408,6 +421,10 @@ def test_web_ui_endpoints():
         record_test("Proxy-SSRF Block: 127.0.0.1 rejected", normalize_proxy_url("http://127.0.0.1:8080") is None)
         record_test("Proxy-SSRF Block: 169.254.169.254 rejected", normalize_proxy_url("http://169.254.169.254:80") is None)
         record_test("Proxy-SSRF Block: 192.168.1.1 rejected", normalize_proxy_url("http://192.168.1.1:3128") is None)
+        record_test("Proxy-SSRF Block: Decimal 2130706433 rejected", normalize_proxy_url("http://2130706433:8080") is None)
+        record_test("Proxy-SSRF Block: Octal 0177.0.0.1 rejected", normalize_proxy_url("http://0177.0.0.1:8080") is None)
+        record_test("Proxy-SSRF Block: Trailing-dot localhost. rejected", normalize_proxy_url("http://localhost.:8080") is None)
+        record_test("Proxy-SSRF Block: sub.localhost rejected", normalize_proxy_url("http://sub.localhost:8080") is None)
 
         masked = mask_proxy_credentials("http://admin:SuperSecret123@203.0.113.5:8080")
         record_test("Proxy Credential Masking hides password", "SuperSecret123" not in masked and "***:***" in masked)
@@ -621,8 +638,12 @@ def test_chrome_extension_and_bridge():
             or "document.write(" in js_src
         )
         record_test(f"{js_name} has no unsafe XSS sinks (innerHTML/eval/document.write)", not unsafe_sink)
+        record_test(f"{js_name} differentiates error_code on 403", "error_code" in js_src and "invalid_token" in js_src)
 
     # 4. Local Bridge Security & Extension Auth Tests
+    import urllib.parse
+    from unittest import mock
+
     bridge_server = ThreadingHTTPServer(("127.0.0.1", 18766), web_ui.AegisWebRequestHandler)
     bt = threading.Thread(target=bridge_server.serve_forever, daemon=True)
     bt.start()
@@ -630,25 +651,40 @@ def test_chrome_extension_and_bridge():
     ext_origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ref_dir = os.path.join(TMP_ROOT, "test_ext_bridge_dl")
 
-    def _req_status(method, path, headers=None, json_body=None):
-        data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
-        req = urllib.request.Request(bridge_url + path, data=data, method=method, headers=headers or {})
+    def _req_raw(method, path, headers=None, raw_bytes=None):
+        req = urllib.request.Request(bridge_url + path, data=raw_bytes, method=method, headers=headers or {})
         try:
             with urllib.request.urlopen(req) as r:
-                raw = r.read().decode("utf-8")
-                return r.status, dict(r.headers), json.loads(raw) if raw else {}
+                raw = r.read()
+                return r.status, {k.lower(): v for k, v in r.headers.items()}, raw
         except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8")
-            return e.code, dict(e.headers), json.loads(raw) if raw else {}
+            raw = e.read()
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, raw
+
+    def _req_status(method, path, headers=None, json_body=None):
+        data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+        st, hdrs, raw = _req_raw(method, path, headers=headers, raw_bytes=data)
+        text = raw.decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(text) if text else {}
+        except ValueError:
+            parsed = {}
+        return st, hdrs, parsed
 
     try:
-        # 4a. GET /api/health with ext origin & NO token -> 403
-        st, _, _ = _req_status("GET", "/api/health", headers={"Origin": ext_origin})
-        record_test("Bridge GET /api/health rejects extension origin without token (403)", st == 403)
+        # 4a. GET /api/health with ext origin & NO token -> 403 + invalid_token
+        st, _, body = _req_status("GET", "/api/health", headers={"Origin": ext_origin})
+        record_test(
+            "Bridge GET /api/health rejects extension origin without token (403 + invalid_token)",
+            st == 403 and body.get("error_code") == "invalid_token"
+        )
 
-        # 4b. GET /api/health with ext origin & WRONG token -> 403
-        st, _, _ = _req_status("GET", "/api/health", headers={"Origin": ext_origin, "X-Aegis-Token": "wrong_token"})
-        record_test("Bridge GET /api/health rejects extension origin with wrong token (403)", st == 403)
+        # 4b. GET /api/health with ext origin & WRONG token -> 403 + invalid_token
+        st, _, body = _req_status("GET", "/api/health", headers={"Origin": ext_origin, "X-Aegis-Token": "wrong_token"})
+        record_test(
+            "Bridge GET /api/health rejects extension origin with wrong token (403 + invalid_token)",
+            st == 403 and body.get("error_code") == "invalid_token"
+        )
 
         # 4c. GET /api/health with ext origin & VALID token -> 200 + CORS header
         st, hdrs, body = _req_status(
@@ -656,20 +692,23 @@ def test_chrome_extension_and_bridge():
             "/api/health",
             headers={"Origin": ext_origin, "X-Aegis-Token": web_ui.EXTENSION_TOKEN},
         )
-        acao = hdrs.get("Access-Control-Allow-Origin")
+        acao = hdrs.get("access-control-allow-origin")
         record_test(
             "Bridge GET /api/health allows authenticated extension (200 + exact ACAO)",
             st == 200 and body.get("status") == "ok" and acao == ext_origin
         )
 
-        # 4d. POST /api/start with ext origin & NO token -> 403
-        st, _, _ = _req_status(
+        # 4d. POST /api/start with ext origin & NO token -> 403 + invalid_token
+        st, _, body = _req_status(
             "POST",
             "/api/start",
             headers={"Origin": ext_origin, "Content-Type": "application/json"},
             json_body={"items": ["BES0002"], "output_dir": ref_dir},
         )
-        record_test("Bridge POST /api/start rejects extension without token (403)", st == 403)
+        record_test(
+            "Bridge POST /api/start rejects extension without token (403 + invalid_token)",
+            st == 403 and body.get("error_code") == "invalid_token"
+        )
 
         # 4e. POST /api/start with external web Origin AND valid token -> 403 (defense in depth)
         st, _, _ = _req_status(
@@ -686,17 +725,17 @@ def test_chrome_extension_and_bridge():
 
         # 4f. OPTIONS /api/start preflight with valid extension Origin -> 204 + X-Aegis-Token allowed
         st, hdrs, _ = _req_status("OPTIONS", "/api/start", headers={"Origin": ext_origin})
-        allow_hdrs = hdrs.get("Access-Control-Allow-Headers", "")
+        allow_hdrs = hdrs.get("access-control-allow-headers", "")
         record_test(
             "Bridge OPTIONS /api/start grants CORS preflight for extension (204)",
-            st == 204 and "X-Aegis-Token" in allow_hdrs and hdrs.get("Access-Control-Allow-Origin") == ext_origin
+            st == 204 and "X-Aegis-Token" in allow_hdrs and hdrs.get("access-control-allow-origin") == ext_origin
         )
 
         # 4g. OPTIONS /api/start preflight with external web Origin -> 403
         st, _, _ = _req_status("OPTIONS", "/api/start", headers={"Origin": "https://evil-attacker.com"})
         record_test("Bridge OPTIONS /api/start blocks external web Origin preflight (403)", st == 403)
 
-        # 4h. POST /api/start with valid ext Origin + valid token + SSRF page_referer -> 403
+        # 4h. POST /api/start with valid ext Origin + valid token + SSRF page_referer -> 403 + security_validation_error
         st, _, body = _req_status(
             "POST",
             "/api/start",
@@ -712,9 +751,76 @@ def test_chrome_extension_and_bridge():
             },
         )
         record_test(
-            "Bridge POST /api/start blocks SSRF internal IP in page_referer (403)",
-            st == 403 and body.get("success") is False
+            "Bridge POST /api/start blocks SSRF internal IP in page_referer (403 + security_validation_error)",
+            st == 403 and body.get("success") is False and body.get("error_code") == "security_validation_error"
         )
+
+        # 4i. IPv6 Host parsing + userinfo smuggling + non-HTTP Origin checks
+        st, _, _ = _req_status("GET", "/api/health", headers={"Host": "[::1]:18766"})
+        record_test("Bridge allows bracketed IPv6 Host [::1]:18766 (200)", st == 200)
+
+        st, _, _ = _req_status("GET", "/api/health", headers={"Host": "localhost@evil.com"})
+        record_test("Bridge rejects userinfo Host header localhost@evil.com (403)", st == 403)
+
+        st, _, _ = _req_status("GET", "/api/health", headers={"Origin": "ftp://localhost"})
+        record_test("Bridge rejects non-HTTP Origin ftp://localhost (403)", st == 403)
+
+        # 4j. GET / Cache-Control: no-store & safe JSON token escaping (XSS prevention)
+        orig_tok = web_ui.EXTENSION_TOKEN
+        try:
+            web_ui.EXTENSION_TOKEN = '</script><img src=x>'
+            st, hdrs, raw_html = _req_raw("GET", "/")
+            html_body = raw_html.decode("utf-8", errors="replace")
+            record_test(
+                "Web UI GET / sets Cache-Control: no-store and escapes token against </script> XSS",
+                st == 200
+                and hdrs.get("cache-control") == "no-store"
+                and "</script><img" not in html_body
+                and "\\u003c/script\\u003e\\u003cimg" in html_body
+            )
+        finally:
+            web_ui.EXTENSION_TOKEN = orig_tok
+
+        # 4k. /api/files and /files/<name> non-PDF & symlink confinement checks
+        os.makedirs(ref_dir, exist_ok=True)
+        with open(os.path.join(ref_dir, "secret.txt"), "wb") as fp:
+            fp.write(b"top secret")
+        with open(os.path.join(ref_dir, "symlink_trap.pdf"), "wb") as fp:
+            fp.write(b"%PDF-1.4\n" + b"0" * 600)
+
+        st, _, _ = _req_raw("GET", f"/files/secret.txt?dir={urllib.parse.quote(ref_dir)}")
+        record_test("Web UI GET /files/secret.txt rejects non-PDF extension (403)", st == 403)
+
+        with mock.patch("os.path.islink", return_value=True):
+            st_list, _, fbody = _req_status("GET", f"/api/files?dir={urllib.parse.quote(ref_dir)}")
+            st_dl, _, _ = _req_raw("GET", f"/files/symlink_trap.pdf?dir={urllib.parse.quote(ref_dir)}")
+        record_test(
+            "Web UI /api/files & /files/ block symlink traversal",
+            st_list == 200 and len(fbody.get("files", [])) == 0 and st_dl == 403
+        )
+
+        # 4l. Malformed POST payloads return clean HTTP 400 (never 500)
+        malformed_cases = [
+            ("/api/start", b"[]", "non-object JSON array"),
+            ("/api/start", json.dumps({"items": ["BES0002"], "concurrency": "abc"}).encode("utf-8"), "non-int concurrency"),
+            ("/api/start", json.dumps({"items": ["BES0002"], "min_delay": "NaN"}).encode("utf-8"), "NaN min_delay"),
+            ("/api/start", json.dumps({"items": ["BES0002"], "proxies": "bad"}).encode("utf-8"), "non-list proxies"),
+            ("/api/start", json.dumps({"items": ["BES0002"], "page_referer": 123}).encode("utf-8"), "non-str page_referer"),
+            ("/api/free-proxies", json.dumps({"count": "bad"}).encode("utf-8"), "non-int free-proxy count"),
+        ]
+        all_400 = True
+        bad_details = []
+        for ep, payload_bytes, desc in malformed_cases:
+            st_m, _, _ = _req_raw(
+                "POST",
+                ep,
+                headers={"Content-Type": "application/json"},
+                raw_bytes=payload_bytes,
+            )
+            if st_m != 400:
+                all_400 = False
+                bad_details.append(f"{desc}->{st_m}")
+        record_test("Web UI malformed POST payloads return HTTP 400 (no 500)", all_400, ", ".join(bad_details))
     finally:
         bridge_server.shutdown()
         bridge_server.server_close()

@@ -70,17 +70,104 @@ class SecurityValidationError(ValueError):
     pass
 
 
+def _is_blocked_ip(ip) -> bool:
+    """Return True if IP (or IPv6-embedded IPv4 address) belongs to a blocked/internal range."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None and _is_blocked_ip(ip.ipv4_mapped):
+            return True
+        if ip.sixtofour is not None and _is_blocked_ip(ip.sixtofour):
+            return True
+        if ip.teredo is not None and any(_is_blocked_ip(t) for t in ip.teredo):
+            return True
+
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return True
+
+    return any(ip in net for net in BLOCKED_NETWORKS)
+
+
+def validate_hostname_not_private(
+    hostname: str,
+    allow_private_ip: bool = False,
+    resolve_dns: bool = True,
+) -> None:
+    """
+    Ensure hostname or numeric IP (including IPv6-mapped IPv4 and legacy inet_aton notations)
+    does not target localhost, link-local metadata, or private/internal networks.
+    """
+    clean_host = (hostname or "").strip().lower().rstrip(".")
+    if not clean_host:
+        raise SecurityValidationError("URL has no valid hostname.")
+
+    if clean_host in BLOCKED_HOSTNAMES or clean_host.endswith(".localhost"):
+        raise SecurityValidationError(f"Access to blocked internal hostname '{hostname}' is forbidden.")
+
+    if allow_private_ip:
+        return
+
+    if "%" in clean_host:
+        raise SecurityValidationError(f"Scoped IPv6 zone-index address '{hostname}' is blocked (SSRF Protection).")
+
+    ip = None
+    try:
+        ip = ipaddress.ip_address(clean_host)
+    except ValueError:
+        try:
+            packed = socket.inet_aton(clean_host)
+            ip = ipaddress.IPv4Address(packed)
+        except OSError:
+            ip = None
+
+    if ip is not None:
+        if _is_blocked_ip(ip):
+            raise SecurityValidationError(
+                f"Access to private/internal IP address '{ip}' is blocked (SSRF Protection)."
+            )
+        return
+
+    if resolve_dns:
+        try:
+            addr_info = socket.getaddrinfo(clean_host, None)
+        except socket.gaierror:
+            return
+
+        for item in addr_info:
+            raw_ip = item[4][0].split("%")[0]
+            try:
+                resolved_ip = ipaddress.ip_address(raw_ip)
+            except ValueError:
+                continue
+            if _is_blocked_ip(resolved_ip):
+                raise SecurityValidationError(
+                    f"Hostname '{clean_host}' resolves to private/internal IP '{resolved_ip}', which is blocked (SSRF Protection)."
+                )
+
+
 def validate_url(url: str, allow_private_ip: bool = False) -> str:
     """
-    Validate target URL against SSRF attacks.
+    Validate target URL against SSRF, CRLF injection, and authority confusion attacks.
+    - Rejects CR/LF/NUL bytes and backslashes in netloc
     - Protocol must be http or https
-    - Hostname must not resolve to internal/private IP
+    - Hostname must not be internal or resolve to internal/private IP
     """
     if not url or not isinstance(url, str):
         raise SecurityValidationError("URL must be a non-empty string.")
 
+    if any(ch in url for ch in ("\r", "\n", "\x00")):
+        raise SecurityValidationError("URL contains disallowed control characters (CRLF/NUL).")
+
     url = url.strip()
     parsed = urlparse(url)
+
+    if "\\" in (parsed.netloc or ""):
+        raise SecurityValidationError("URL authority contains disallowed backslash character.")
 
     if parsed.scheme.lower() not in ("http", "https"):
         raise SecurityValidationError(f"Invalid URL scheme '{parsed.scheme}'. Only 'http' and 'https' are allowed.")
@@ -89,33 +176,7 @@ def validate_url(url: str, allow_private_ip: bool = False) -> str:
     if not hostname:
         raise SecurityValidationError("URL has no valid hostname.")
 
-    hostname_lower = hostname.lower()
-    if hostname_lower in BLOCKED_HOSTNAMES:
-        raise SecurityValidationError(f"Access to blocked internal hostname '{hostname}' is forbidden.")
-
-    if not allow_private_ip:
-        try:
-            ip = ipaddress.ip_address(hostname)
-            for net in BLOCKED_NETWORKS:
-                if ip in net:
-                    raise SecurityValidationError(
-                        f"Access to private/internal IP address '{ip}' is blocked (SSRF Protection)."
-                    )
-        except ValueError:
-            # Resolve domain name to inspect all target A/AAAA records
-            try:
-                addr_info = socket.getaddrinfo(hostname, None)
-                for item in addr_info:
-                    raw_ip = item[4][0]
-                    ip = ipaddress.ip_address(raw_ip)
-                    for net in BLOCKED_NETWORKS:
-                        if ip in net:
-                            raise SecurityValidationError(
-                                f"Hostname '{hostname}' resolves to private/internal IP '{ip}', which is blocked (SSRF Protection)."
-                            )
-            except socket.gaierror:
-                pass
-
+    validate_hostname_not_private(hostname, allow_private_ip=allow_private_ip, resolve_dns=True)
     return url
 
 

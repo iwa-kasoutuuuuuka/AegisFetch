@@ -22,6 +22,8 @@ import re
 import csv
 import sys
 import hmac
+import html
+import math
 import uuid
 import time
 import json
@@ -74,8 +76,14 @@ def _load_or_create_extension_token() -> str:
 
     new_tok = secrets.token_urlsafe(24)
     try:
-        with open(token_path, "w", encoding="utf-8") as f:
-            f.write(new_tok)
+        if os.name != "nt":
+            fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_tok)
+            os.chmod(token_path, 0o600)
+        else:
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(new_tok)
     except OSError:
         pass
     return new_tok
@@ -347,7 +355,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AegisFetch Web UI v2.2 - Resilient Catalog Downloader</title>
+  <title>AegisFetch Web UI v__VERSION__ - Resilient Catalog Downloader</title>
   <style>
     :root {
       --bg-dark: #0b0f19;
@@ -732,7 +740,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 </div>
 
 <script>
-  const EXTENSION_TOKEN = "__EXTENSION_TOKEN__";
+  const EXTENSION_TOKEN = __EXTENSION_TOKEN_JSON__;
   let activeJobId = null;
   let pollTimer = null;
   let lastFailedItems = [];
@@ -1211,8 +1219,16 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
 
     def _is_valid_local_host(self) -> bool:
         host = (self.headers.get("Host") or "").lower().strip()
-        host_only = host.split(":")[0]
-        return host_only in ("127.0.0.1", "localhost", "[::1]", "")
+        if not host:
+            return True
+        try:
+            parsed = urlparse(f"http://{host}")
+            _ = parsed.port
+        except ValueError:
+            return False
+        if parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+            return False
+        return parsed.hostname in ("127.0.0.1", "localhost", "::1")
 
     def _get_validated_extension_origin(self) -> Optional[str]:
         origin = (self.headers.get("Origin") or "").strip()
@@ -1224,27 +1240,27 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         provided = (self.headers.get("X-Aegis-Token") or "").strip()
         return bool(provided) and hmac.compare_digest(provided, EXTENSION_TOKEN)
 
-    def _check_local_request(self, is_post: bool = False) -> Tuple[bool, str]:
+    def _check_local_request(self, is_post: bool = False) -> Tuple[bool, str, str]:
         if not self._is_valid_local_host():
-            return False, "Forbidden Host header (DNS Rebinding Protection)."
+            return False, "Forbidden Host header (DNS Rebinding Protection).", "forbidden_host"
 
         origin = (self.headers.get("Origin") or "").strip()
         if not origin:
-            return True, ""
+            return True, "", ""
 
         if self._EXT_ORIGIN_RE.match(origin):
             if self._has_valid_extension_token():
-                return True, ""
-            return False, "Invalid or missing X-Aegis-Token header for browser extension."
+                return True, "", ""
+            return False, "Invalid or missing X-Aegis-Token header for browser extension.", "invalid_token"
 
         parsed_orig = urlparse(origin)
-        if parsed_orig.hostname in ("127.0.0.1", "localhost", "::1"):
-            return True, ""
+        if parsed_orig.scheme in ("http", "https") and parsed_orig.hostname in ("127.0.0.1", "localhost", "::1"):
+            return True, "", ""
 
-        return False, "Forbidden Origin/Host header (CSRF & DNS Rebinding Protection)."
+        return False, "Forbidden Origin/Host header (CSRF & DNS Rebinding Protection).", "forbidden_origin"
 
     def _is_safe_local_request(self, is_post: bool = False) -> bool:
-        ok, _ = self._check_local_request(is_post=is_post)
+        ok, _, _ = self._check_local_request(is_post=is_post)
         return ok
 
     def _send_json(self, data: Dict[str, Any], status: int = 200):
@@ -1263,11 +1279,20 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _read_json_body(self) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > 8 * 1024 * 1024:
+        raw_cl = (self.headers.get("Content-Length") or "0").strip()
+        try:
+            length = int(raw_cl)
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length header.") from exc
+        if length <= 0:
             return {}
+        if length > 8 * 1024 * 1024:
+            raise ValueError("Request body exceeds 8MB limit.")
         raw = self.rfile.read(length)
-        return json.loads(raw.decode("utf-8"))
+        parsed = json.loads(raw.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON body must be an object.")
+        return parsed
 
     def do_OPTIONS(self):
         ext_origin = self._get_validated_extension_origin()
@@ -1281,12 +1306,12 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        self._send_json({"success": False, "message": "Forbidden CORS preflight."}, 403)
+        self._send_json({"success": False, "error_code": "forbidden_origin", "message": "Forbidden CORS preflight."}, 403)
 
     def do_GET(self):
-        ok, reason = self._check_local_request(is_post=False)
+        ok, reason, err_code = self._check_local_request(is_post=False)
         if not ok:
-            self._send_json({"success": False, "message": reason}, 403)
+            self._send_json({"success": False, "error_code": err_code, "message": reason}, 403)
             return
 
         parsed = urlparse(self.path)
@@ -1295,16 +1320,25 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         query = {k: v[0] for k, v in qs.items() if v}
 
         if path == "/" or path == "/index.html":
+            safe_default_dir = html.escape(DEFAULT_DOWNLOAD_DIR.replace("\\", "/"), quote=True)
+            safe_token_json = (
+                json.dumps(EXTENSION_TOKEN)
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026")
+            )
+            safe_version = html.escape(__version__, quote=True)
             page = (
                 HTML_DASHBOARD
-                .replace("__DEFAULT_DIR__", DEFAULT_DOWNLOAD_DIR.replace("\\", "/"))
-                .replace("__EXTENSION_TOKEN__", EXTENSION_TOKEN)
-                .replace("__VERSION__", __version__)
+                .replace("__DEFAULT_DIR__", safe_default_dir)
+                .replace("__EXTENSION_TOKEN_JSON__", safe_token_json)
+                .replace("__VERSION__", safe_version)
             )
             raw = page.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.end_headers()
@@ -1367,17 +1401,24 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     self._send_json({"success": True, "directory": safe_dir, "files": []})
                     return
 
+                real_safe_dir = os.path.realpath(safe_dir)
                 files_info = []
                 for fname in sorted(os.listdir(safe_dir)):
                     if fname.lower().endswith(".pdf"):
                         fpath = os.path.join(safe_dir, fname)
-                        if os.path.isfile(fpath):
-                            st = os.stat(fpath)
-                            files_info.append({
-                                "name": fname,
-                                "size_kb": round(st.st_size / 1024, 1),
-                                "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
-                            })
+                        if os.path.islink(fpath) or not os.path.isfile(fpath):
+                            continue
+                        try:
+                            if os.path.commonpath([real_safe_dir, os.path.realpath(fpath)]) != real_safe_dir:
+                                continue
+                        except ValueError:
+                            continue
+                        st = os.stat(fpath)
+                        files_info.append({
+                            "name": fname,
+                            "size_kb": round(st.st_size / 1024, 1),
+                            "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+                        })
                 self._send_json({"success": True, "directory": safe_dir, "files": files_info})
             except SecurityValidationError as sve:
                 self._send_json({"success": False, "message": str(sve)}, 403)
@@ -1498,6 +1539,18 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             try:
                 safe_dir = validate_output_directory(req_dir)
                 safe_file = secure_output_path(safe_dir, raw_fname)
+                if not safe_file.lower().endswith(".pdf") or os.path.islink(safe_file):
+                    self.send_error(HTTPStatus.FORBIDDEN)
+                    return
+                real_safe_dir = os.path.realpath(safe_dir)
+                real_safe_file = os.path.realpath(safe_file)
+                try:
+                    confined = os.path.commonpath([real_safe_dir, real_safe_file]) == real_safe_dir
+                except ValueError:
+                    confined = False
+                if not confined:
+                    self.send_error(HTTPStatus.FORBIDDEN)
+                    return
                 if not os.path.exists(safe_file) or not os.path.isfile(safe_file):
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
@@ -1506,6 +1559,8 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/pdf")
                 self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(content)
             except SecurityValidationError:
@@ -1515,7 +1570,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
-        ok, reason = self._check_local_request(is_post=True)
+        ok, reason, err_code = self._check_local_request(is_post=True)
         if not ok:
             # Drain small unread POST body to prevent Windows TCP RST (WinError 10054) on early 403 close
             try:
@@ -1524,7 +1579,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     self.rfile.read(cl)
             except Exception:
                 pass
-            self._send_json({"success": False, "message": reason}, 403)
+            self._send_json({"success": False, "error_code": err_code, "message": reason}, 403)
             return
 
         parsed = urlparse(self.path)
@@ -1539,7 +1594,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/parse-file":
             filename = body.get("filename", "")
             content_b64 = body.get("content_b64", "")
-            if not filename or not content_b64:
+            if not isinstance(filename, str) or not isinstance(content_b64, str) or not filename or not content_b64:
                 self._send_json({"success": False, "message": "Missing file data"}, 400)
                 return
             try:
@@ -1564,7 +1619,15 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 return
 
             verify_live = bool(body.get("verify_live", True))
-            target_count = int(body.get("count", 12))
+            raw_count = body.get("count", 12)
+            if isinstance(raw_count, bool):
+                self._send_json({"success": False, "message": "Invalid count parameter."}, 400)
+                return
+            try:
+                target_count = max(1, min(50, int(raw_count)))
+            except (ValueError, TypeError):
+                self._send_json({"success": False, "message": "Invalid count parameter."}, 400)
+                return
             res = fetch_and_test_free_proxies(
                 target_working_count=target_count,
                 verify_live=verify_live
@@ -1573,26 +1636,57 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/start":
-            items = body.get("items", [])
-            if not items or not isinstance(items, list):
+            raw_items = body.get("items", [])
+            if not isinstance(raw_items, list) or not all(isinstance(x, str) for x in raw_items):
+                self._send_json({"success": False, "message": "items must be a list of strings."}, 400)
+                return
+            items = [x.strip() for x in raw_items if x.strip()]
+            if not items:
                 self._send_json({"success": False, "message": "items list is empty."}, 400)
                 return
             if len(items) > 1000:
                 self._send_json({"success": False, "message": "Max 1000 items per batch."}, 400)
                 return
 
-            proxies = body.get("proxies", [])
-            proxy_rotation_mode = body.get("proxy_rotation_mode", "round_robin")
+            raw_proxies = body.get("proxies", [])
+            if raw_proxies is None:
+                raw_proxies = []
+            if not isinstance(raw_proxies, list) or not all(isinstance(p, str) for p in raw_proxies):
+                self._send_json({"success": False, "message": "proxies must be a list of strings."}, 400)
+                return
+            proxies = raw_proxies
+
+            raw_referer = body.get("page_referer")
+            if raw_referer is not None and not isinstance(raw_referer, str):
+                self._send_json({"success": False, "message": "page_referer must be a string."}, 400)
+                return
+            page_referer = (raw_referer or "").strip() or None
+
+            raw_conc = body.get("concurrency", 1)
+            raw_min_delay = body.get("min_delay", 0.6)
+            raw_max_delay = body.get("max_delay", 1.5)
+            if any(isinstance(v, bool) for v in (raw_conc, raw_min_delay, raw_max_delay)):
+                self._send_json({"success": False, "message": "Invalid numeric parameter type."}, 400)
+                return
+            try:
+                concurrency = max(1, min(8, int(raw_conc)))
+                parsed_min = float(raw_min_delay)
+                parsed_max = float(raw_max_delay)
+                if not (math.isfinite(parsed_min) and math.isfinite(parsed_max)):
+                    raise ValueError("Non-finite delay value")
+                min_delay = max(0.2, min(60.0, parsed_min))
+                max_delay = max(min_delay + 0.2, min(60.0, parsed_max))
+            except (ValueError, TypeError):
+                self._send_json({"success": False, "message": "Invalid numeric parameters (concurrency/min_delay/max_delay)."}, 400)
+                return
+
+            proxy_rotation_mode = str(body.get("proxy_rotation_mode") or "round_robin")
             fallback_to_direct = bool(body.get("fallback_to_direct", True))
             req_dir = body.get("output_dir") or DEFAULT_DOWNLOAD_DIR
-            locale = body.get("locale", "ja-jp")
+            locale = str(body.get("locale") or "ja-jp")
             auto_fallback_locales = bool(body.get("auto_fallback_locales", True))
             enable_generic_search = bool(body.get("enable_generic_search", True))
             check_updates = bool(body.get("check_updates", False))
-            concurrency = max(1, min(8, int(body.get("concurrency", 1))))
-            min_delay = max(0.2, float(body.get("min_delay", 0.6)))
-            max_delay = max(min_delay + 0.2, float(body.get("max_delay", 1.5)))
-            page_referer = (body.get("page_referer") or "").strip() or None
 
             try:
                 if page_referer:
@@ -1600,7 +1694,11 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 target_dir = validate_output_directory(req_dir)
                 os.makedirs(target_dir, exist_ok=True)
             except SecurityValidationError as sve:
-                self._send_json({"success": False, "message": str(sve)}, 403)
+                self._send_json({
+                    "success": False,
+                    "error_code": "security_validation_error",
+                    "message": str(sve)
+                }, 403)
                 return
 
             job_id = f"ui_{uuid.uuid4().hex[:8]}"
@@ -1651,6 +1749,9 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/cancel":
             job_id = body.get("job_id", "")
+            if not isinstance(job_id, str) or not job_id:
+                self._send_json({"success": False, "message": "Invalid job_id"}, 400)
+                return
             with _UI_JOBS_LOCK:
                 if job_id in _UI_JOBS:
                     _UI_JOBS[job_id]["cancel_requested"] = True

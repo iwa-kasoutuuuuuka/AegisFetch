@@ -9,6 +9,59 @@ let currentSettings = {
 };
 let activePageUrl = "";
 let pollTimer = null;
+let isSubmitting = false;
+
+function isPrivateOrLocalHostname(hostname) {
+  const h = (hostname || "").toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost")) {
+    return true;
+  }
+  if (!h.includes(".") && !h.includes(":")) {
+    return true;
+  }
+  if (h.includes(":")) {
+    return (
+      h === "::1" ||
+      h === "::" ||
+      h.startsWith("fc") ||
+      h.startsWith("fd") ||
+      h.startsWith("fe80") ||
+      h.startsWith("::ffff:")
+    );
+  }
+  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (ipv4Match) {
+    const a = Number(ipv4Match[1]);
+    const b = Number(ipv4Match[2]);
+    if (a === 127 || a === 10 || a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+  }
+  return false;
+}
+
+function getSafePublicReferer(urlStr, items) {
+  if (!urlStr || !Array.isArray(items)) {
+    return undefined;
+  }
+  const hasUrlItem = items.some((it) => /^https?:\/\//i.test((it || "").trim()));
+  if (!hasUrlItem) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(urlStr.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return undefined;
+    }
+    if (isPrivateOrLocalHostname(parsed.hostname)) {
+      return undefined;
+    }
+    return parsed.href;
+  } catch (e) {
+    return undefined;
+  }
+}
 
 function isAllowedLocalServer(urlStr) {
   try {
@@ -90,9 +143,18 @@ async function checkServerHealth() {
       return true;
     }
     if (resp.status === 403) {
-      setStatusBadge("auth", "トークン未設定/不一致");
-      document.getElementById("settingsPanel").classList.remove("hidden");
-      showSettingsNotice("Web UI 右上の「🔑 拡張トークンをコピー」からトークンを設定してください。");
+      let errData = {};
+      try {
+        errData = await resp.json();
+      } catch (_) {}
+      if (!errData.error_code || errData.error_code === "invalid_token") {
+        setStatusBadge("auth", "トークン未設定/不一致");
+        document.getElementById("settingsPanel").classList.remove("hidden");
+        showSettingsNotice("Web UI 右上の「🔑 拡張トークンをコピー」からトークンを設定してください。");
+      } else {
+        setStatusBadge("offline", "接続拒否 (403)");
+        showSettingsNotice(errData.message || "ローカルブリッジへの接続が拒否されました。");
+      }
       return false;
     }
     setStatusBadge("offline", `Error ${resp.status}`);
@@ -169,12 +231,13 @@ function injectedPageScanner() {
   const results = [];
 
   const addCandidate = (rawUrl, textLabel) => {
-    if (!rawUrl || rawUrl.startsWith("#") || rawUrl.startsWith("javascript:")) {
+    const trimmed = (rawUrl || "").trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.toLowerCase().startsWith("javascript:")) {
       return;
     }
     let absUrl;
     try {
-      absUrl = new URL(rawUrl, window.location.href).href;
+      absUrl = new URL(trimmed, window.location.href).href;
     } catch (e) {
       return;
     }
@@ -255,18 +318,25 @@ async function scanActiveTab() {
 async function sendDownloadJob(items, pageReferer) {
   const statusEl = document.getElementById("jobStatusText");
   const barEl = document.getElementById("jobProgressBar");
+  const btnSelected = document.getElementById("btnSendSelected");
+  const btnQuick = document.getElementById("btnSendQuick");
 
-  if (!items || items.length === 0) {
+  if (!items || items.length === 0 || isSubmitting) {
     return;
   }
+
+  isSubmitting = true;
+  if (btnSelected) btnSelected.disabled = true;
+  if (btnQuick) btnQuick.disabled = true;
 
   statusEl.textContent = `送信中 (${items.length}件)...`;
   barEl.style.width = "5%";
 
   try {
+    const safeReferer = getSafePublicReferer(pageReferer, items);
     const payload = {
       items,
-      page_referer: pageReferer && pageReferer.startsWith("http") ? pageReferer : undefined,
+      page_referer: safeReferer,
       output_dir: currentSettings.outputDir || undefined
     };
 
@@ -275,17 +345,25 @@ async function sendDownloadJob(items, pageReferer) {
       body: JSON.stringify(payload)
     });
 
+    let data = {};
+    try {
+      data = await resp.json();
+    } catch (_) {}
+
     if (resp.status === 403) {
-      setStatusBadge("auth", "認証エラー (403)");
-      document.getElementById("settingsPanel").classList.remove("hidden");
-      showSettingsNotice("トークンが無効です。Web UI から最新のトークンをコピーしてください。");
-      statusEl.textContent = "認証エラー: トークンを確認してください";
+      if (data.error_code === "invalid_token") {
+        setStatusBadge("auth", "認証エラー (403)");
+        document.getElementById("settingsPanel").classList.remove("hidden");
+        showSettingsNotice("トークンが無効です。Web UI から最新のトークンをコピーしてください。");
+        statusEl.textContent = "認証エラー: トークンを確認してください";
+      } else {
+        statusEl.textContent = `エラー: ${data.message || "リクエストが拒否されました"}`;
+      }
       barEl.style.width = "0%";
       return;
     }
 
-    const data = await resp.json();
-    if (!data.success) {
+    if (!resp.ok || !data.success) {
       statusEl.textContent = `エラー: ${data.message || "送信失敗"}`;
       barEl.style.width = "0%";
       return;
@@ -299,6 +377,10 @@ async function sendDownloadJob(items, pageReferer) {
     statusEl.textContent = "通信エラー: Web UI が起動していません";
     barEl.style.width = "0%";
     setStatusBadge("offline", "Offline");
+  } finally {
+    isSubmitting = false;
+    if (btnQuick) btnQuick.disabled = false;
+    if (btnSelected) updateSendSelectedState();
   }
 }
 

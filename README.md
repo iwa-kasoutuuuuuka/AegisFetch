@@ -235,6 +235,11 @@ python test_mcp_security.py
 
 ## Changelog / 更新履歴
 
+- **v2.4.1**:
+  - **SSRF & Proxy Hardening (`security.py`, `proxy_manager.py`, `extractors.py`)**: Fixed `SecurityValidationError` swallowing during IP parsing, blocked IPv4-mapped/6to4/Teredo/scoped IPv6, legacy `inet_aton` IP notations (decimal/hex/octal/shorthand), `.localhost`/trailing-dot hostnames, CRLF/NUL injection, and backslash authority confusion; added Playwright `page.route` SSRF guard with clean `unroute_all` teardown and strict BALLUFF `locale` validation.
+  - **Web UI Bridge Security & Validation (`web_ui.py`)**: Fixed IPv6 `[::1]:port` Host parsing and userinfo smuggling, enforced `http`/`https` schemes for local web origins, escaped `EXTENSION_TOKEN` via `json.dumps` Unicode escaping, added `Cache-Control: no-store` on `/` and `/files/`, enforced `0o600` POSIX token file permissions, added `.pdf`/`islink`/`realpath` confinement on `/api/files` & `/files/<name>`, differentiated 403 `error_code`, and added strict HTTP `400` validation for malformed POST payloads.
+  - **Chrome / Edge Extension Fixes (`chrome_extension/`)**: Added `getSafePublicReferer()` to omit private/intranet `page_referer` on part-number or internal-page requests, differentiated `error_code === "invalid_token"` from SSRF/security 403s, trimmed scanned URLs before `javascript:`/`#` checks, added double-submit guard (`popup.js`), and managed badge timer cleanup (`background.js`).
+  - **Regression Tests**: Expanded suite to **108/108 PASS** online (**97/97 PASS** offline CI) plus Playwright Chromium MV3 live extension verification.
 - **v2.4.0**:
   - Added **AegisFetch Companion** Chrome / Edge extension (`chrome_extension/`, Manifest V3) with active-tab PDF scanner, right-click context menus (selection part numbers & links), live job progress bar, and PNG icons (`16x16`, `48x48`, `128x128`).
   - Upgraded `web_ui.py` local bridge with persistent `X-Aegis-Token` auth, strict `chrome-extension://` CORS & preflight handling, `GET /api/health`, `page_referer` SSRF validation in `POST /api/start`, and header token copy button.

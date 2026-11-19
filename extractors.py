@@ -71,13 +71,36 @@ def _fetch_html_playwright(url: str) -> str:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
+        page = None
         try:
             page = browser.new_page(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
+
+            def _ssrf_route_guard(route):
+                req_url = route.request.url or ""
+                try:
+                    if req_url.startswith(("data:", "blob:", "about:")):
+                        route.continue_()
+                        return
+                    try:
+                        validate_url(req_url)
+                    except SecurityValidationError:
+                        route.abort("blockedbyclient")
+                        return
+                    route.continue_()
+                except Exception:
+                    pass
+
+            page.route("**/*", _ssrf_route_guard)
             page.goto(url, wait_until="domcontentloaded", timeout=25000)
             return page.content()
         finally:
+            if page is not None:
+                try:
+                    page.unroute_all(behavior="ignoreErrors")
+                except Exception:
+                    pass
             browser.close()
 
 
@@ -125,7 +148,10 @@ class CatalogExtractor:
         """
         order_code, filename = cls.parse_balluff_code(part_code)
 
-        locales_to_try = [locale]
+        clean_locale = (locale or "").strip().lower()
+        if not re.match(r"^[a-z]{2}-[a-z]{2}$", clean_locale):
+            clean_locale = "ja-jp"
+        locales_to_try = [clean_locale]
         if auto_fallback_locales:
             for fb in ("ja-jp", "en-us", "de-de"):
                 if fb not in locales_to_try:
@@ -150,7 +176,7 @@ class CatalogExtractor:
                         page_html
                     )
                 if matches:
-                    pdf_url = html.unescape(matches[0].replace("\\/", "/"))
+                    pdf_url = validate_url(html.unescape(matches[0].replace("\\/", "/")))
                     return {
                         "part_number": part_code,
                         "order_code": order_code,

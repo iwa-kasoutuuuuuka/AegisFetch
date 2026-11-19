@@ -10,13 +10,12 @@ Provides:
 import re
 import time
 import random
-import ipaddress
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Tuple
 from curl_cffi import requests
 
-from security import BLOCKED_NETWORKS, BLOCKED_HOSTNAMES
+from security import validate_hostname_not_private, SecurityValidationError
 
 # Verified high-uptime public proxy sources (updated every 5-15 mins on GitHub)
 FREE_PROXY_SOURCES = [
@@ -89,15 +88,10 @@ def normalize_proxy_url(
         return None
 
     if block_private_ip:
-        if host in BLOCKED_HOSTNAMES:
-            return None
         try:
-            ip = ipaddress.ip_address(host)
-            for net in BLOCKED_NETWORKS:
-                if ip in net:
-                    return None
-        except ValueError:
-            pass
+            validate_hostname_not_private(host, allow_private_ip=False, resolve_dns=True)
+        except SecurityValidationError:
+            return None
 
     return s.rstrip("/")
 
