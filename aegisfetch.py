@@ -41,7 +41,7 @@ from security import (
 )
 from proxy_manager import ProxyRotator, fetch_and_test_free_proxies, mask_proxy_credentials
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 
 @dataclass

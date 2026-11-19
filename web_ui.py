@@ -197,13 +197,26 @@ def _run_ui_download_job(
                     source_tag = "direct_url"
                 else:
                     fetcher._ensure_thread_session(rotate_proxy=(fetcher.proxy_rotator.total_count > 0))
-                    resolved = CatalogExtractor.resolve_any_part(
-                        item,
-                        locale=locale,
-                        auto_fallback_locales=auto_fallback_locales,
-                        enable_generic_search=enable_generic_search,
-                        session=fetcher.session
-                    )
+                    try:
+                        resolved = CatalogExtractor.resolve_any_part(
+                            item,
+                            locale=locale,
+                            auto_fallback_locales=auto_fallback_locales,
+                            enable_generic_search=enable_generic_search,
+                            session=fetcher.session
+                        )
+                    except Exception:
+                        if fetcher.current_proxy and fetcher.fallback_to_direct:
+                            fetcher.proxy_rotator.report_failure(fetcher.current_proxy)
+                            resolved = CatalogExtractor.resolve_any_part(
+                                item,
+                                locale=locale,
+                                auto_fallback_locales=auto_fallback_locales,
+                                enable_generic_search=enable_generic_search,
+                                session=None
+                            )
+                        else:
+                            raise
                     resolved_url = resolved["url"]
                     source_tag = resolved.get("resolved_locale") or resolved.get("source", "resolved")
                     res = fetcher.download_file(
@@ -1083,7 +1096,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   function exportResultsCsv() {
     if (!lastJobResults || lastJobResults.length === 0) return;
     const headers = ['No', 'Input', 'Filename', 'Status', 'SizeKB', 'Source', 'ProxyUsed', 'URL', 'Error', 'Time'];
-    const esc = (v) => '"' + String(v === null || v === undefined ? '' : v).replace(/"/g, '""') + '"';
+    const esc = (v) => {
+      let s = String(v === null || v === undefined ? '' : v);
+      // Neutralize CSV / Excel Formula Injection
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      return '"' + s.replace(/"/g, '""') + '"';
+    };
     const rows = [headers.join(',')];
     for (const r of lastJobResults) {
       const st = r.skipped ? 'SKIPPED' : (r.updated ? 'UPDATED' : (r.success ? 'OK' : 'FAILED'));
@@ -1265,10 +1283,18 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     self._send_json({"success": False, "message": "Directory does not exist."}, 404)
                     return
 
-                pdf_files = [
-                    f for f in sorted(os.listdir(safe_dir))
-                    if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(safe_dir, f))
-                ]
+                real_safe_dir = os.path.realpath(safe_dir)
+                pdf_files = []
+                for f in sorted(os.listdir(safe_dir)):
+                    if not f.lower().endswith(".pdf"):
+                        continue
+                    fp = os.path.join(safe_dir, f)
+                    if os.path.islink(fp) or not os.path.isfile(fp):
+                        continue
+                    if os.path.commonpath([real_safe_dir, os.path.realpath(fp)]) != real_safe_dir:
+                        continue
+                    pdf_files.append(f)
+
                 if not pdf_files:
                     self._send_json({"success": False, "message": "No PDF files found to archive."}, 404)
                     return
@@ -1304,38 +1330,48 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     self._send_json({"success": False, "message": "Directory does not exist."}, 404)
                     return
 
-                pdf_files = [
-                    f for f in sorted(os.listdir(safe_dir))
-                    if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(safe_dir, f))
-                ]
+                real_safe_dir = os.path.realpath(safe_dir)
+                pdf_files = []
+                for f in sorted(os.listdir(safe_dir)):
+                    if not f.lower().endswith(".pdf"):
+                        continue
+                    fp = os.path.join(safe_dir, f)
+                    if os.path.islink(fp) or not os.path.isfile(fp):
+                        continue
+                    if os.path.commonpath([real_safe_dir, os.path.realpath(fp)]) != real_safe_dir:
+                        continue
+                    pdf_files.append(f)
+
                 if not pdf_files:
                     self._send_json({"success": False, "message": "No PDF files found to merge."}, 404)
                     return
 
                 from pypdf import PdfWriter
                 writer = PdfWriter()
-                total_size = 0
-                merged_count = 0
-                for fname in pdf_files:
-                    fpath = os.path.join(safe_dir, fname)
-                    total_size += os.path.getsize(fpath)
-                    if total_size > MAX_EXPORT_ARCHIVE_BYTES:
-                        self._send_json({"success": False, "message": "Total size exceeds 250MB merge limit."}, 400)
+                try:
+                    total_size = 0
+                    merged_count = 0
+                    for fname in pdf_files:
+                        fpath = os.path.join(safe_dir, fname)
+                        total_size += os.path.getsize(fpath)
+                        if total_size > MAX_EXPORT_ARCHIVE_BYTES:
+                            self._send_json({"success": False, "message": "Total size exceeds 250MB merge limit."}, 400)
+                            return
+                        try:
+                            writer.append(fpath)
+                            merged_count += 1
+                        except Exception:
+                            continue
+
+                    if merged_count == 0:
+                        self._send_json({"success": False, "message": "No valid PDF files could be merged."}, 400)
                         return
-                    try:
-                        writer.append(fpath)
-                        merged_count += 1
-                    except Exception:
-                        continue
 
-                if merged_count == 0:
-                    self._send_json({"success": False, "message": "No valid PDF files could be merged."}, 400)
-                    return
-
-                out_buf = io.BytesIO()
-                writer.write(out_buf)
-                writer.close()
-                merged_bytes = out_buf.getvalue()
+                    out_buf = io.BytesIO()
+                    writer.write(out_buf)
+                    merged_bytes = out_buf.getvalue()
+                finally:
+                    writer.close()
 
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/pdf")

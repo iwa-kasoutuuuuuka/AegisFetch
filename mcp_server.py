@@ -338,12 +338,24 @@ def _run_background_job(
             try:
                 if is_part_numbers and not item.lower().startswith("http"):
                     fetcher._ensure_thread_session(rotate_proxy=(fetcher.proxy_rotator.total_count > 0))
-                    resolved = CatalogExtractor.resolve_any_part(
-                        item,
-                        auto_fallback_locales=True,
-                        enable_generic_search=enable_generic_search,
-                        session=fetcher.session
-                    )
+                    try:
+                        resolved = CatalogExtractor.resolve_any_part(
+                            item,
+                            auto_fallback_locales=True,
+                            enable_generic_search=enable_generic_search,
+                            session=fetcher.session
+                        )
+                    except Exception:
+                        if fetcher.current_proxy and fetcher.fallback_to_direct:
+                            fetcher.proxy_rotator.report_failure(fetcher.current_proxy)
+                            resolved = CatalogExtractor.resolve_any_part(
+                                item,
+                                auto_fallback_locales=True,
+                                enable_generic_search=enable_generic_search,
+                                session=None
+                            )
+                        else:
+                            raise
                     res = fetcher.download_file(
                         url=resolved["url"],
                         filename=resolved["filename"],

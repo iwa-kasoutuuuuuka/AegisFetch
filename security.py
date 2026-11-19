@@ -133,19 +133,27 @@ def validate_redirect_target(current_url: str, location_header: str, allow_priva
 def validate_output_directory(output_dir: str) -> str:
     """
     Ensure output directory is not a critical system directory or startup folder.
+    Checks both raw input and resolved absolute path for cross-platform (Windows/Linux) safety.
     """
     if not output_dir or not isinstance(output_dir, str):
         raise SecurityValidationError("Output directory must be a valid path string.")
 
-    abs_dir = os.path.abspath(output_dir)
-    norm_lower = abs_dir.lower().replace("/", "\\")
-    posix_lower = abs_dir.lower().replace("\\", "/")
+    raw_str = output_dir.strip()
+    abs_dir = os.path.abspath(raw_str)
+
+    candidates = {
+        raw_str.lower().replace("/", "\\"),
+        raw_str.lower().replace("\\", "/"),
+        abs_dir.lower().replace("/", "\\"),
+        abs_dir.lower().replace("\\", "/"),
+    }
 
     for pattern in FORBIDDEN_DIR_PATTERNS:
-        if re.search(pattern, norm_lower) or re.search(pattern, posix_lower):
-            raise SecurityValidationError(
-                f"Writing to protected system directory '{abs_dir}' is forbidden."
-            )
+        for cand in candidates:
+            if re.search(pattern, cand):
+                raise SecurityValidationError(
+                    f"Writing to protected system directory '{abs_dir}' is forbidden."
+                )
 
     return abs_dir
 

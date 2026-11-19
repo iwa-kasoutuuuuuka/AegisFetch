@@ -1,5 +1,5 @@
-"""
-AegisFetch v2.0 MCP Server - Full Security, Extractor & Background Job Test Suite
+r"""
+AegisFetch v2.3.1 MCP Server - Full Security, Extractor & Background Job Test Suite
 ==================================================================================
 Tests:
 1. All 8 MCP Tools Registration & Schema Integrity

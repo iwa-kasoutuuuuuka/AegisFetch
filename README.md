@@ -216,6 +216,11 @@ python test_mcp_security.py
 
 ## Changelog / 更新履歴
 
+- **v2.3.1**:
+  - Fixed cross-platform system directory validation (`C:\Windows` checks on Ubuntu Linux CI) and Python 3.12 docstring escape warning.
+  - Added CSV / Excel Formula Injection protection (`=`, `+`, `-`, `@`) to Web UI report exports.
+  - Hardened `/api/download-zip` and `/api/merge-pdf` against symlink traversal (`islink` + `realpath` confinement) and ensured deterministic `PdfWriter.close()`.
+  - Added automatic Direct fallback when proxy-routed part resolution fails.
 - **v2.3.0**:
   - Added Web UI ZIP bulk download (`/api/download-zip`), PDF merger (`/api/merge-pdf` via `pypdf`), BOM UTF-8 CSV report export, and `localStorage` auto-saved UI settings.
   - Shared thread-local proxy-rotated sessions with `CatalogExtractor` part resolution to eliminate redundant TLS handshakes and prevent Cloudflare blocks on product pages.
