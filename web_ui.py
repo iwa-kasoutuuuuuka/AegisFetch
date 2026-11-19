@@ -1,10 +1,12 @@
 """
-AegisFetch Web UI Dashboard (v2.1)
-==================================
-Interactive browser-based GUI for AegisFetch.
-Allows users to paste part numbers (e.g., BALLUFF order codes) or URLs,
-extract PDFs from product pages, monitor real-time download progress,
-and view/manage downloaded catalogs directly from any browser.
+AegisFetch Web UI Dashboard (v2.1.0)
+====================================
+Interactive browser-based GUI for AegisFetch with Multi-Proxy Rotation & Free Proxy Harvester.
+Allows users to:
+- Paste part numbers (e.g., BALLUFF order codes) or URLs
+- Configure a list of proxies for automatic 1-request-per-IP rotation
+- Harvest & live-test free public proxies with 1 click
+- Extract PDFs from product pages & monitor real-time download progress
 
 Security:
 - Bound strictly to 127.0.0.1 by default
@@ -22,17 +24,17 @@ import argparse
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from aegisfetch import AegisFetch, __version__
 from extractors import CatalogExtractor
+from proxy_manager import fetch_and_test_free_proxies, DEFAULT_FREE_PROXIES
 from security import (
     validate_url,
     validate_output_directory,
     sanitize_filename,
     secure_output_path,
     SecurityValidationError,
-    DEFAULT_MAX_FILE_SIZE,
 )
 
 DEFAULT_PORT = 8765
@@ -50,14 +52,20 @@ def _run_ui_download_job(
     min_delay: float,
     max_delay: float,
     verify_pdf: bool,
-    locale: str = "ja-jp"
+    locale: str = "ja-jp",
+    proxies: Optional[List[str]] = None,
+    proxy_rotation_mode: str = "round_robin",
+    fallback_to_direct: bool = True,
 ):
-    """Background worker for Web UI batch downloads with cancellation support."""
+    """Background worker for Web UI batch downloads with proxy rotation & cancellation support."""
     try:
         fetcher = AegisFetch(
             output_dir=target_dir,
             min_delay=min_delay,
             max_delay=max_delay,
+            proxies=proxies,
+            proxy_rotation_mode=proxy_rotation_mode,
+            fallback_to_direct=fallback_to_direct,
             verify_pdf=verify_pdf,
             quiet=True
         )
@@ -80,11 +88,11 @@ def _run_ui_download_job(
                     res = fetcher.download_file(url=safe_u, filename=fname)
                     resolved_url = safe_u
                 else:
-                    # Treat as Part Number / Order Code (e.g. BES0002)
+                    # Resolve Part Number (e.g. BES0002) using direct or current session
                     resolved = CatalogExtractor.resolve_balluff_part(
                         item,
                         locale=locale,
-                        session=fetcher.session
+                        session=None
                     )
                     resolved_url = resolved["url"]
                     res = fetcher.download_file(
@@ -102,6 +110,7 @@ def _run_ui_download_job(
                     "success": res.success,
                     "skipped": res.skipped,
                     "size_kb": round(res.size_bytes / 1024, 2),
+                    "proxy_used": res.proxy_used or "DIRECT",
                     "error": res.error_msg,
                     "timestamp": time.strftime("%H:%M:%S")
                 }
@@ -115,6 +124,7 @@ def _run_ui_download_job(
                     "success": False,
                     "skipped": False,
                     "size_kb": 0,
+                    "proxy_used": fetcher.current_proxy or "DIRECT",
                     "error": str(e),
                     "timestamp": time.strftime("%H:%M:%S")
                 }
@@ -122,6 +132,7 @@ def _run_ui_download_job(
             with _UI_JOBS_LOCK:
                 job = _UI_JOBS[job_id]
                 job["completed_items"] = idx
+                job["last_proxy"] = entry["proxy_used"]
                 job["results"].append(entry)
                 if entry["skipped"]:
                     job["skipped_count"] += 1
@@ -144,7 +155,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AegisFetch Web UI - Resilient Catalog Downloader</title>
+  <title>AegisFetch Web UI - Resilient Catalog Downloader &amp; Proxy Rotator</title>
   <style>
     :root {
       --bg-dark: #0b0f19;
@@ -153,7 +164,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       --border: #233252;
       --cyan: #00f2fe;
       --blue: #4facfe;
-      --purple: #6b11ff;
+      --purple: #a855f7;
       --green: #10b981;
       --amber: #f59e0b;
       --red: #ef4444;
@@ -205,6 +216,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       display: flex;
       gap: 10px;
       align-items: center;
+      flex-wrap: wrap;
     }
     .badge {
       font-size: 0.75rem;
@@ -214,15 +226,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       border: 1px solid rgba(0, 242, 254, 0.3);
       color: var(--cyan);
     }
+    .badge-purple {
+      background: rgba(168, 85, 247, 0.12);
+      border: 1px solid rgba(168, 85, 247, 0.4);
+      color: #d8b4fe;
+    }
     .container {
-      max-width: 1240px;
-      margin: 24px auto;
+      max-width: 1280px;
+      margin: 22px auto;
       padding: 0 20px;
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1.08fr 0.92fr;
       gap: 22px;
     }
-    @media (max-width: 960px) {
+    @media (max-width: 980px) {
       .container { grid-template-columns: 1fr; }
     }
     .card {
@@ -242,6 +259,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       margin-bottom: 14px;
       padding-bottom: 10px;
       border-bottom: 1px solid rgba(255,255,255,0.06);
+      flex-wrap: wrap;
+      gap: 8px;
     }
     .card-header h2 {
       font-size: 1.02rem;
@@ -252,9 +271,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
     label {
       display: block;
-      font-size: 0.82rem;
+      font-size: 0.81rem;
       color: var(--text-muted);
-      margin-bottom: 6px;
+      margin-bottom: 5px;
       font-weight: 500;
     }
     textarea, input[type="text"], input[type="number"], select {
@@ -263,8 +282,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       border: 1px solid var(--border);
       border-radius: 8px;
       color: var(--text-main);
-      padding: 10px 12px;
-      font-size: 0.88rem;
+      padding: 9px 12px;
+      font-size: 0.85rem;
       font-family: 'Consolas', 'Monaco', monospace;
       transition: border-color 0.2s;
     }
@@ -274,9 +293,31 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       box-shadow: 0 0 0 2px rgba(0, 242, 254, 0.15);
     }
     textarea {
-      min-height: 210px;
+      min-height: 145px;
       resize: vertical;
       line-height: 1.45;
+    }
+    .proxy-section {
+      margin-top: 16px;
+      padding: 14px;
+      background: rgba(14, 20, 36, 0.65);
+      border: 1px solid rgba(168, 85, 247, 0.3);
+      border-radius: 10px;
+    }
+    .proxy-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .proxy-header h3 {
+      font-size: 0.9rem;
+      color: #e9d5ff;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
     .form-grid {
       display: grid;
@@ -294,13 +335,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       cursor: pointer;
       border: none;
       border-radius: 8px;
-      padding: 10px 18px;
-      font-size: 0.88rem;
+      padding: 9px 16px;
+      font-size: 0.85rem;
       font-weight: 600;
       transition: all 0.2s;
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
     }
     .btn-primary {
       background: linear-gradient(135deg, var(--cyan), var(--blue));
@@ -310,6 +351,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .btn-primary:hover:not(:disabled) {
       transform: translateY(-1px);
       box-shadow: 0 6px 20px rgba(0, 242, 254, 0.4);
+    }
+    .btn-purple {
+      background: linear-gradient(135deg, #9333ea, #6366f1);
+      color: #ffffff;
+      padding: 5px 11px;
+      font-size: 0.76rem;
+    }
+    .btn-purple:hover:not(:disabled) {
+      filter: brightness(1.15);
     }
     .btn-secondary {
       background: #1e293b;
@@ -371,19 +421,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       font-weight: 700;
     }
     .stat-card .lbl {
-      font-size: 0.73rem;
+      font-size: 0.72rem;
       color: var(--text-muted);
       margin-top: 2px;
     }
     .log-list {
-      max-height: 295px;
+      max-height: 410px;
       overflow-y: auto;
       background: var(--bg-input);
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 10px;
       font-family: 'Consolas', monospace;
-      font-size: 0.8rem;
+      font-size: 0.79rem;
     }
     .log-item {
       padding: 6px 8px;
@@ -397,12 +447,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .tag {
       padding: 2px 7px;
       border-radius: 4px;
-      font-size: 0.72rem;
+      font-size: 0.71rem;
       font-weight: 700;
+      white-space: nowrap;
     }
     .tag-ok { background: rgba(16, 185, 129, 0.2); color: #34d399; }
     .tag-skip { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
     .tag-fail { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+    .tag-proxy { background: rgba(168, 85, 247, 0.2); color: #d8b4fe; margin-right: 4px; }
     .file-table {
       width: 100%;
       border-collapse: collapse;
@@ -426,9 +478,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .file-link:hover { text-decoration: underline; }
     .extractor-box {
       display: flex;
-      gap: 10px;
-      margin-top: 8px;
+      gap: 8px;
+      margin-top: 6px;
     }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+      font-size: 0.8rem;
+      color: var(--text-main);
+    }
+    .checkbox-row input { width: auto; }
   </style>
 </head>
 <body>
@@ -437,18 +498,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <div class="brand">
     <img src="/assets/icon.svg" alt="AegisFetch" />
     <div class="brand-title">
-      <h1>AegisFetch Web Console</h1>
-      <p>Anti-403 WAF-Evading Catalog &amp; PDF Downloader</p>
+      <h1>AegisFetch Web Console v2.1</h1>
+      <p>Anti-403 WAF-Evading Catalog Downloader &amp; Multi-Proxy IP Rotator</p>
     </div>
   </div>
   <div class="badge-group">
     <span class="badge">TLS Fingerprint: Chrome124 / Safari</span>
-    <span class="badge">SSRF &amp; Traversal Guard: ACTIVE</span>
+    <span class="badge badge-purple" id="headerProxyBadge">Proxy Rotation: Ready</span>
+    <span class="badge">SSRF Guard: ACTIVE</span>
   </div>
 </header>
 
 <div class="container">
-  <!-- Left Card: Input & Controls -->
+  <!-- Left Card: Input, Proxy Rotation & Controls -->
   <div class="card">
     <div class="card-header">
       <h2>📥 カタログ一括ダウンロード設定</h2>
@@ -458,11 +520,48 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <label for="itemsInput">型番リスト（例: BES0002）または PDFのURL を1行ずつ入力:</label>
     <textarea id="itemsInput" placeholder="BES0002(BES G06EB-NOC40F-S49G)&#10;BES0003(BES G06EB-NSC40F-S49G)&#10;https://example.com/datasheet.pdf"></textarea>
 
-    <div style="margin-top: 14px;">
+    <div style="margin-top: 12px;">
       <label for="extractUrlInput">🔍 WebページからPDFリンクを自動抽出して上のリストに追加:</label>
       <div class="extractor-box">
         <input type="text" id="extractUrlInput" placeholder="https://www.balluff.com/ja-jp/products/BES0002" />
         <button class="btn-secondary" id="btnExtract" onclick="extractLinksFromPage()" style="white-space:nowrap;">ページ解析</button>
+      </div>
+    </div>
+
+    <!-- Proxy Rotation Box -->
+    <div class="proxy-section">
+      <div class="proxy-header">
+        <h3>🌐 プロキシ自動ローテーション (1件ごとに別IPへ切替)</h3>
+        <div style="display:flex; gap:6px;">
+          <button class="btn-purple" id="btnHarvestProxies" onclick="harvestFreeProxies(true)">
+            ⚡ 無料プロキシを自動取得＆生存テスト
+          </button>
+          <button class="btn-secondary" style="padding:5px 9px; font-size:0.74rem;" onclick="loadPresetProxies()">
+            📋 プリセット挿入
+          </button>
+          <button class="btn-secondary" style="padding:5px 9px; font-size:0.74rem;" onclick="clearProxies()">
+            クリア
+          </button>
+        </div>
+      </div>
+
+      <label for="proxiesInput">プロキシリスト (1行に1つ `http://IP:PORT` または `socks5://IP:PORT` / 空欄なら直接通信):</label>
+      <textarea id="proxiesInput" style="min-height: 95px; font-size:0.8rem;" placeholder="http://176.111.37.5:39811&#10;http://91.134.141.4:3128&#10;socks5://208.102.51.6:58208" oninput="updateProxyCountBadge()"></textarea>
+
+      <div class="form-grid" style="margin-top:8px;">
+        <div>
+          <label for="proxyModeSelect">IPローテーション順序:</label>
+          <select id="proxyModeSelect">
+            <option value="round_robin" selected>順番に切り替え (Round-Robin: 1件ごとに次へ)</option>
+            <option value="random">ランダムに切り替え (Random)</option>
+          </select>
+        </div>
+        <div style="display:flex; align-items:flex-end;">
+          <label class="checkbox-row" style="margin-bottom:6px; cursor:pointer;">
+            <input type="checkbox" id="fallbackDirectCheck" checked />
+            <span>プロキシ不通時は直接通信(Direct)で救済する</span>
+          </label>
+        </div>
       </div>
     </div>
 
@@ -510,12 +609,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </div>
 
     <div class="progress-box">
-      <div style="display:flex; justify-content:space-between; font-size:0.85rem;">
-        <span id="currentItemText">ジョブ開始待機中...</span>
-        <span id="progressPercent">0% (0/0)</span>
+      <div style="display:flex; justify-content:space-between; font-size:0.84rem; gap:10px;">
+        <span id="currentItemText" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">ジョブ開始待機中...</span>
+        <span id="progressPercent" style="white-space:nowrap;">0% (0/0)</span>
       </div>
       <div class="progress-bar-bg">
         <div class="progress-bar-fill" id="progressBar"></div>
+      </div>
+      <div style="font-size:0.76rem; color:#d8b4fe; margin-top:4px;" id="activeProxyText">
+        現在の通信経路: DIRECT (標準回線)
       </div>
 
       <div class="stats-grid">
@@ -538,7 +640,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
     </div>
 
-    <label>実行ログ (最新順):</label>
+    <label>実行ログ (1件ごとの使用プロキシIP ＆ 結果):</label>
     <div class="log-list" id="logList">
       <div style="color:var(--text-muted); text-align:center; padding: 30px 0;">
         左側のフォームに型番またはURLを入力して「ダウンロード開始」を押してください。
@@ -579,6 +681,66 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       "BES0004(BES G06EB-POC40F-S49G)",
       "BES0005(BES G06EB-PSC40F-S49G)"
     ].join("\\n");
+  }
+
+  function getConfiguredProxies() {
+    const raw = document.getElementById('proxiesInput').value;
+    return raw.split(/\\r?\\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+  }
+
+  function updateProxyCountBadge() {
+    const list = getConfiguredProxies();
+    const badge = document.getElementById('headerProxyBadge');
+    if (list.length > 0) {
+      badge.textContent = `Proxy Rotation: ACTIVE (${list.length} IPs)`;
+    } else {
+      badge.textContent = 'Proxy Rotation: DIRECT';
+    }
+  }
+
+  async function harvestFreeProxies(verifyLive) {
+    const btn = document.getElementById('btnHarvestProxies');
+    btn.disabled = true;
+    btn.textContent = "⏳ 公開プロキシ収集＆生存テスト中(約4秒)...";
+    try {
+      const resp = await fetch('/api/free-proxies', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({verify_live: verifyLive, count: 12})
+      });
+      const data = await resp.json();
+      if (!data.success) {
+        alert("無料プロキシ取得エラー: " + (data.message || ""));
+        return;
+      }
+      const ta = document.getElementById('proxiesInput');
+      ta.value = (data.working_proxies || []).join("\\n");
+      updateProxyCountBadge();
+      alert(`公開リスト(${data.fetched_total}件)から高速に応答する無料プロキシ ${data.working_proxies.length} 件を抽出し、セットしました！`);
+    } catch (e) {
+      alert("通信エラー: " + e);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⚡ 無料プロキシを自動取得＆生存テスト";
+    }
+  }
+
+  async function loadPresetProxies() {
+    const resp = await fetch('/api/free-proxies', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({preset_only: true})
+    });
+    const data = await resp.json();
+    if (data.working_proxies) {
+      document.getElementById('proxiesInput').value = data.working_proxies.join("\\n");
+      updateProxyCountBadge();
+    }
+  }
+
+  function clearProxies() {
+    document.getElementById('proxiesInput').value = "";
+    updateProxyCountBadge();
   }
 
   async function extractLinksFromPage() {
@@ -627,6 +789,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       alert("型番またはURLを1件以上入力してください。");
       return;
     }
+    const proxies = getConfiguredProxies();
+    const proxy_rotation_mode = document.getElementById('proxyModeSelect').value;
+    const fallback_to_direct = document.getElementById('fallbackDirectCheck').checked;
     const output_dir = document.getElementById('outputDir').value.trim();
     const locale = document.getElementById('localeSelect').value;
     const min_delay = parseFloat(document.getElementById('minDelay').value) || 0.8;
@@ -639,7 +804,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const resp = await fetch('/api/start', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({items, output_dir, locale, min_delay, max_delay})
+        body: JSON.stringify({
+          items,
+          proxies,
+          proxy_rotation_mode,
+          fallback_to_direct,
+          output_dir,
+          locale,
+          min_delay,
+          max_delay
+        })
       });
       const data = await resp.json();
       if (!data.success) {
@@ -685,6 +859,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.getElementById('progressBar').style.width = pct + '%';
       document.getElementById('progressPercent').textContent = `${pct}% (${job.completed_items}/${job.total_items})`;
 
+      if (job.last_proxy) {
+        document.getElementById('activeProxyText').textContent = `直近の通信経路 (IP): ${job.last_proxy}`;
+      }
+
       if (job.status === 'running') {
         document.getElementById('currentItemText').textContent = "処理中: " + (job.current_item || "...");
       } else {
@@ -715,6 +893,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       left.style.whiteSpace = 'nowrap';
       left.textContent = `[#${r.index}] ${r.input} -> ${r.filename || r.error || ''}`;
 
+      const rightWrap = document.createElement('div');
+      rightWrap.style.display = 'flex';
+      rightWrap.style.alignItems = 'center';
+
+      if (r.proxy_used && r.proxy_used !== 'SKIPPED') {
+        const pTag = document.createElement('span');
+        pTag.className = 'tag tag-proxy';
+        pTag.textContent = r.proxy_used;
+        rightWrap.appendChild(pTag);
+      }
+
       const right = document.createElement('span');
       if (r.skipped) {
         right.className = 'tag tag-skip';
@@ -727,8 +916,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         right.textContent = 'FAILED';
       }
 
+      rightWrap.appendChild(right);
       row.appendChild(left);
-      row.appendChild(right);
+      row.appendChild(rightWrap);
       container.appendChild(row);
     }
   }
@@ -786,7 +976,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     });
   }
 
-  window.addEventListener('DOMContentLoaded', refreshFileList);
+  window.addEventListener('DOMContentLoaded', () => {
+    refreshFileList();
+    updateProxyCountBadge();
+  });
 </script>
 </body>
 </html>
@@ -797,7 +990,6 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
     """HTTP Handler for AegisFetch Web UI Console."""
 
     def log_message(self, format: str, *args: Any):
-        # Quiet standard request logs to keep terminal clean
         pass
 
     def _send_json(self, data: Dict[str, Any], status: int = 200):
@@ -865,6 +1057,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     "skipped_count": job["skipped_count"],
                     "failed_count": job["failed_count"],
                     "current_item": job.get("current_item"),
+                    "last_proxy": job.get("last_proxy"),
                     "percent": pct,
                     "results": job["results"][-100:]
                 })
@@ -926,6 +1119,25 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"success": False, "message": f"Invalid JSON: {e}"}, 400)
             return
 
+        if path == "/api/free-proxies":
+            if body.get("preset_only"):
+                self._send_json({
+                    "success": True,
+                    "fetched_total": len(DEFAULT_FREE_PROXIES),
+                    "working_count": len(DEFAULT_FREE_PROXIES),
+                    "working_proxies": list(DEFAULT_FREE_PROXIES)
+                })
+                return
+
+            verify_live = bool(body.get("verify_live", True))
+            target_count = int(body.get("count", 12))
+            res = fetch_and_test_free_proxies(
+                target_working_count=target_count,
+                verify_live=verify_live
+            )
+            self._send_json(res)
+            return
+
         if path == "/api/start":
             items = body.get("items", [])
             if not items or not isinstance(items, list):
@@ -935,6 +1147,9 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "message": "Max 1000 items per batch."}, 400)
                 return
 
+            proxies = body.get("proxies", [])
+            proxy_rotation_mode = body.get("proxy_rotation_mode", "round_robin")
+            fallback_to_direct = bool(body.get("fallback_to_direct", True))
             req_dir = body.get("output_dir") or DEFAULT_DOWNLOAD_DIR
             locale = body.get("locale", "ja-jp")
             min_delay = max(0.2, float(body.get("min_delay", 0.8)))
@@ -958,6 +1173,7 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
                     "skipped_count": 0,
                     "failed_count": 0,
                     "current_item": None,
+                    "last_proxy": None,
                     "cancel_requested": False,
                     "output_dir": target_dir,
                     "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -967,7 +1183,18 @@ class AegisWebRequestHandler(BaseHTTPRequestHandler):
 
             t = threading.Thread(
                 target=_run_ui_download_job,
-                args=(job_id, items, target_dir, min_delay, max_delay, True, locale),
+                args=(
+                    job_id,
+                    items,
+                    target_dir,
+                    min_delay,
+                    max_delay,
+                    True,
+                    locale,
+                    proxies,
+                    proxy_rotation_mode,
+                    fallback_to_direct,
+                ),
                 daemon=True
             )
             t.start()

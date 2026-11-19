@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aegisfetch"
-version = "2.0.1"
+version = "2.1.0"
 description = "High-resilience, anti-403, and WAF-evading catalog & document downloader with MCP Server"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,4 +28,4 @@ aegisfetch-mcp = "mcp_server:main"
 aegisfetch-ui = "web_ui:main"
 
 [tool.setuptools]
-py-modules = ["aegisfetch", "mcp_server", "security", "extractors", "web_ui"]
+py-modules = ["aegisfetch", "mcp_server", "security", "extractors", "web_ui", "proxy_manager"]

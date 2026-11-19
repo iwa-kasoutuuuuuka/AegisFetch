@@ -96,6 +96,9 @@ aegisfetch --extract-url "https://www.balluff.com/ja-jp/products/BES0002" --out-
 
 # 4. Download from a list file (URLs or part numbers) / リストファイルから一括取得
 aegisfetch --list-file "urls.txt" --out-dir "./my_catalogs" --min-delay 1.0 --max-delay 2.5
+
+# 5. Download with Multi-Proxy IP Rotation & Auto Free Proxies / 無料プロキシ自動取得＆1件ごとIPローテーション
+aegisfetch --list-file "urls.txt" --auto-free-proxies --out-dir "./my_catalogs"
 ```
 
 ### Python SDK

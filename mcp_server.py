@@ -20,6 +20,7 @@ from mcp.server.mcpserver import MCPServer
 
 from aegisfetch import AegisFetch, __version__
 from extractors import CatalogExtractor
+from proxy_manager import fetch_and_test_free_proxies, DEFAULT_FREE_PROXIES
 from security import (
     validate_url,
     validate_output_directory,
@@ -477,6 +478,24 @@ def verify_file(file_path: str) -> str:
         "is_valid_pdf": is_pdf,
         "is_suspicious_html": is_html
     }, ensure_ascii=False, indent=2)
+
+
+@server.tool(
+    name="aegisfetch_fetch_free_proxies",
+    description=(
+        "Harvest and live-test free public HTTP/SOCKS5 proxies against Cloudflare HTTPS trace. "
+        "Returns a verified list of fast, working proxies for automatic IP rotation."
+    )
+)
+def fetch_free_proxies(target_count: int = 12, verify_live: bool = True) -> str:
+    """
+    Harvest and verify free public proxies.
+    """
+    res = fetch_and_test_free_proxies(
+        target_working_count=min(30, max(1, target_count)),
+        verify_live=verify_live
+    )
+    return json.dumps(res, ensure_ascii=False, indent=2)
 
 
 @server.tool(

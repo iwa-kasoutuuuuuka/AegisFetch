@@ -66,6 +66,7 @@ async def test_mcp_registration():
         "aegisfetch_start_batch_job",
         "aegisfetch_get_job_status",
         "aegisfetch_verify_file",
+        "aegisfetch_fetch_free_proxies",
         "aegisfetch_get_status",
     ]
     for exp in expected:
@@ -339,6 +340,33 @@ def test_web_ui_endpoints():
         with urllib.request.urlopen(f"{base_url}/files/{fname}?dir={test_dir}") as r:
             pdf_bytes = r.read()
             record_test("Web UI GET /files/<name> streams valid PDF", pdf_bytes.startswith(b"%PDF"))
+
+        # 6. Test ProxyRotator & Web UI POST /api/free-proxies
+        from proxy_manager import ProxyRotator
+        rot = ProxyRotator(["1.1.1.1:8080", "http://2.2.2.2:3128", "socks5://3.3.3.3:1080"])
+        p1, p2, p3, p4 = rot.get_next_proxy(), rot.get_next_proxy(), rot.get_next_proxy(), rot.get_next_proxy()
+        record_test(
+            "ProxyRotator round-robin switches IP on every call",
+            p1 == "http://1.1.1.1:8080" and p2 == "http://2.2.2.2:3128" and p3 == "socks5://3.3.3.3:1080" and p4 == p1
+        )
+
+        # Dead proxy eviction test
+        rot.report_failure("http://1.1.1.1:8080")
+        rot.report_failure("http://1.1.1.1:8080")
+        record_test("ProxyRotator evicts dead proxy after threshold", "http://1.1.1.1:8080" not in rot.active_proxies)
+
+        # Web UI /api/free-proxies endpoint test
+        req_fp = urllib.request.Request(
+            base_url + "/api/free-proxies",
+            data=json.dumps({"preset_only": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req_fp) as r:
+            fp_data = json.loads(r.read().decode("utf-8"))
+            record_test(
+                "Web UI POST /api/free-proxies returns proxy list",
+                fp_data.get("success") is True and len(fp_data.get("working_proxies", [])) >= 5
+            )
 
     finally:
         ui_server.shutdown()
