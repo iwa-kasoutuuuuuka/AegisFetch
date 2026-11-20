@@ -75,7 +75,7 @@ pip install -e .
 ### 1. Web UI Console (Browser GUI) / ブラウザ操作画面
 
 Launch the interactive Web UI dashboard (automatically opens `http://127.0.0.1:8765` in your browser):
-ブラウザから直感的に型番リストの貼り付け・ページ内PDF抽出・リアルタイム進捗確認・PDF閲覧ができる Web UI モードを起動します：
+ブラウザから直感的に型番リストの貼り付け・Excel/CSV読込・ページ内PDF抽出・リアルタイム進捗確認・PDF結合/ZIP出力ができる Web UI を起動します：
 
 ```bash
 # Command line launch / コマンドで起動
@@ -83,26 +83,77 @@ aegisfetch-ui
 
 # Or double-click on Windows / またはバッチファイルをダブルクリック
 Start_AegisFetch_WebUI.bat
+
+# Headless background launch (no browser tab opened) / ブラウザを開かずにサーバーのみ起動
+aegisfetch-ui --no-browser
 ```
+
+**Basic Web UI Workflow / Web UI の基本操作手順**:
+1. **Input Part Numbers or URLs / 型番・URLの入力**:
+   - Paste part numbers (e.g., `BES0002`, `E2E-X1R5E1`, `LR-ZB100N`, `SY3120-5LZD-C6`, `FX5U-32MR/ES`) or PDF URLs line by line, **or** drag & drop an `.xlsx` / `.csv` / `.txt` BOM file directly into the text box.
+   - 型番（BALLUFF / OMRON / KEYENCE / SMC / 三菱電機・その他メーカー）や PDF URL を1行ずつ入力するか、`.xlsx` / `.csv` / `.txt` の部品表ファイルをそのままドラッグ＆ドロップします。
+2. **Optional Proxy & Speed Tuning / プロキシ・並列・改訂チェック設定（任意）**:
+   - Click **`⚡ 無料プロキシ取得＆テスト`** to auto-harvest working proxies, set **Concurrency (1–5)**, choose preferred **Locale**, or enable **Catalog Revision Check** (`ETag` / `Last-Modified`).
+   - 必要に応じて **`⚡ 無料プロキシ取得＆テスト`** でプロキシをセットし、並列数（1〜5）・優先言語・改訂チェックを設定します。
+3. **Start, Monitor & Export / 実行・確認・出力**:
+   - Click **`🚀 ダウンロード開始`** to monitor per-item logs in real time. Jobs launched from the Chrome/Edge extension also sync automatically under **`ジョブ履歴 (拡張機能連携)`**.
+   - **`🚀 ダウンロード開始`** を押すと進捗と通信経路がリアルタイム表示されます。Chrome/Edge 拡張から開始したジョブも **`ジョブ履歴 (拡張機能連携)`** に自動同期されます。
+   - After completion, use **`🔄 失敗分のみ再試行`**, **`📊 結果CSV出力`**, **`📦 ZIP一括ダウンロード`**, or **`📑 全PDFを1冊に結合`**.
+   - 完了後は **`🔄 失敗分のみ再試行`**・**`📊 結果CSV出力`**・**`📦 ZIP一括ダウンロード`**・**`📑 全PDFを1冊に結合`** を利用できます。
+
+#### Windows Silent Auto-Start on Reboot / Windows 再起動時のバックグラウンド自動起動
+
+To keep the local bridge running silently in the background on Windows sign-in (with no console window or browser popup), register a Task Scheduler job using `pythonw.exe`:
+PC再起動（サインイン）後に黒い画面やブラウザタブを出さず裏側で自動起動させたい場合は、PowerShell でタスクスケジューラに登録します：
+
+```powershell
+$pythonw = (Get-Command pythonw).Source
+$repoDir = "e:\temp\AegisFetch"  # Change to your clone path / ご自身のクローン先パスに変更
+$action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$repoDir\web_ui.py`" --no-browser" -WorkingDirectory $repoDir
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName "AegisFetchWebUI" -Action $action -Trigger $trigger -Settings $settings -Force
+```
+
+> **To remove auto-start / 自動起動を解除する場合**:
+> ```powershell
+> schtasks /Delete /TN "AegisFetchWebUI" /F
+> ```
+
+---
 
 ### 2. Chrome / Edge Extension (`AegisFetch Companion` - v2.5.0) / Chrome・Edge 拡張機能
 
 Send PDF links and selected part numbers directly from your everyday Chrome/Edge browser (even on login-protected or JS-rendered pages) to your local AegisFetch server:
 普段お使いの Chrome / Edge で開いているページ（要ログイン会員サイトや JS 動的ページを含む）から、ワンクリックや右クリックメニューで AegisFetch にダウンロードを送信できます：
 
+#### Setup (First Time Only) / 初回セットアップ (約30秒)
 1. **Start Web UI / Web UI 起動**:
-   - Launch `aegisfetch-ui` (or `Start_AegisFetch_WebUI.bat`). / `aegisfetch-ui`（または `Start_AegisFetch_WebUI.bat`）を起動します。
-2. **Load Extension / 拡張機能の読み込み (約30秒)**:
-   - Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**. / `chrome://extensions`（または `edge://extensions`）を開き、**デベロッパー モード** を有効にします。
-   - Click **Load unpacked** and select the `chrome_extension/` folder. / **パッケージ化されていない拡張機能を読み込む** をクリックし、`chrome_extension/` フォルダを選択します。
+   - Launch `aegisfetch-ui` (or `Start_AegisFetch_WebUI.bat`, or enable auto-start above). / `aegisfetch-ui`（または `Start_AegisFetch_WebUI.bat`、もしくは上記の自動起動）を起動します。
+2. **Load Extension / 拡張機能の読み込み**:
+   - Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**. / アドレスバーに `chrome://extensions`（Edge は `edge://extensions`）と入力し、**デベロッパー モード** を **ON** にします。
+   - Click **Load unpacked** and select `<your-repo>/chrome_extension/`. / **パッケージ化されていない拡張機能を読み込む** をクリックし、`AegisFetch\chrome_extension` フォルダを選択します。
 3. **Token Pairing / トークン連携**:
-   - Click **`🔑 拡張トークンをコピー`** in the Web UI header. / Web UI ヘッダーの **`🔑 拡張トークンをコピー`** をクリックします。
-   - Open the **AegisFetch Companion** popup (`⚙️`) and paste the token to connect securely. / 拡張機能のポップアップ右上 (`⚙️`) を開き、トークンを貼り付けて保存します。
+   - Open `http://127.0.0.1:8765` and click **`🔑 拡張トークンをコピー`** in the header. / `http://127.0.0.1:8765` の右上にある **`🔑 拡張トークンをコピー`** をクリックします。
+   - Click the **AegisFetch Companion** toolbar icon ➔ **`⚙️`** ➔ paste the token ➔ **`💾 設定を保存`**. Once connected, the badge turns green (**`Online v2.5.0`**). / Chrome ツールバーの **AegisFetch Companion**（🧩 パズルアイコン内、ピン留め推奨）➔ 右上 **`⚙️`** へトークンを貼り付けて **`💾 設定を保存`** を押すと、ステータスが **`Online v2.5.0`** になります。
 
-**Capabilities / 主な機能**:
-- **Auto-Scan Active Tab / 開いているページのPDF自動スキャン**: Detects `.pdf` / `pdfengine` / datasheet links inside the active page and lets you pick items with checkboxes. / 表示中ページ内の `.pdf`・`pdfengine`・データシートリンクを検出し、チェックボックスで選んで一括送信できます。
-- **Right-Click Context Menu / 右クリックメニュー**: Highlight any part number (e.g., `BES0002`) or right-click a link ➔ **`🛡️ AegisFetch で取得`**. / ページ上の型番テキストを選択、またはリンクを右クリックして **`🛡️ AegisFetch で取得`** から即座にダウンロードを開始できます。
-- **Strict Least-Privilege Security / 最小権限セキュリティ**: Uses `activeTab` only (no `<all_urls>` spy permissions), strict MV3 CSP (`script-src 'self'`), and `X-Aegis-Token` + `chrome-extension://` Origin verification. / 最小権限（`activeTab` のみで `<all_urls>` 不使用）、厳格な MV3 CSP（`script-src 'self'`）、`X-Aegis-Token`＋`chrome-extension://` Origin 検証を採用しています。
+#### How to Use the Extension / 拡張機能の使い方
+- **Mode A — Scan PDFs on Current Page (`📄 ページPDF抽出`)**:
+  - Open any product/catalog page and click the extension icon. It automatically scans `.pdf`, `pdfengine`, and datasheet links on the page. Check the items you want and click **`🚀 選択したPDFをダウンロード`**.
+  - 製品ページやカタログ一覧を開いた状態で拡張アイコンを押すと、ページ内の PDF リンクを自動検出します。必要なものにチェックを入れて **`🚀 選択したPDFをダウンロード`** を押すだけで取得できます。
+  - **Login-Protected / Member-Only PDFs (`🔐 ログイン中セッション経由で取得`)**: Check this option when downloading PDFs that require your browser's active login cookies; the extension fetches the PDF inside your logged-in tab session and saves it securely to AegisFetch via `/api/save-browser-pdf`.
+  - **会員限定・要ログインPDFの場合**: **`🔐 ログイン中セッション経由で取得`** にチェックを入れると、ログイン済みブラウザの Cookie セッションを使って PDF を取得し、ローカルの保存先フォルダへ安全に保存します。
+- **Mode B — Quick Send Part Numbers / URLs (`✏️ 型番・URL送信`)**:
+  - Switch to the **`✏️ 型番・URL送信`** tab (any highlighted text on the page is pre-filled automatically), enter part numbers or URLs, and click **`🚀 AegisFetch へ送信`**.
+  - **`✏️ 型番・URL送信`** タブでは型番や URL を直接送信できます（ページ上で文字を選択していれば自動で入力欄に入ります）。
+- **Mode C — Right-Click Context Menu (`🛡️ AegisFetch で取得`)**:
+  - Highlight a part number (e.g., `BES0002`, `E2E-X1R5E1`) or right-click any PDF link ➔ **`🛡️ AegisFetch で取得`**.
+  - ページ上の型番テキストを選択して右クリック、またはリンク上で右クリック ➔ **`🛡️ AegisFetch で取得`** を選ぶとポップアップを開かずに即ダウンロードを開始します（アイコン上のバッジで結果通知: `OK`=開始成功 / `KEY`=トークン未設定・不一致 / `BLK`=セキュリティ遮断 / `ERR`=Web UI未起動など）。
+- **Extension Settings (`⚙️`) / 詳細設定**:
+  - Configure **Server URL** (supports custom local ports on `127.0.0.1` / `localhost`), **Output Dir**, **Concurrency (1/2/3/5)**, **Preferred Locale**, and **Catalog Revision Check**.
+  - **`⚙️`** から接続先ポート、保存先フォルダ、並列数（1/2/3/5）、優先言語、改訂チェックの有無をカスタマイズできます。
+
+---
 
 ### 3. Command Line (CLI) / コマンドライン
 
@@ -116,8 +167,8 @@ aegisfetch --balluff-parts BES0002 BES0003 --out-dir "./my_catalogs"
 # 3. Extract all PDFs from a product page / 製品ページからPDFを自動抽出
 aegisfetch --extract-url "https://www.balluff.com/ja-jp/products/BES0002" --out-dir "./my_catalogs"
 
-# 4. Download from a list file (URLs or part numbers) / リストファイルから一括取得
-aegisfetch --list-file "urls.txt" --out-dir "./my_catalogs" --min-delay 1.0 --max-delay 2.5
+# 4. Download from a list file with parallelism & revision check / リストファイルから並列＆改訂チェック付き一括取得
+aegisfetch --list-file "urls.txt" --out-dir "./my_catalogs" --concurrency 3 --check-updates
 
 # 5. Download with Multi-Proxy IP Rotation & Auto Free Proxies / 無料プロキシ自動取得＆1件ごとIPローテーション
 aegisfetch --list-file "urls.txt" --auto-free-proxies --out-dir "./my_catalogs"
